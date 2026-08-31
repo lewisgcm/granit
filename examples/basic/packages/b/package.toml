@@ -1,0 +1,10 @@
+[package]
+name = "b"
+tools = ["coreutils"]
+dependencies = ["a:hello"]
+
+[commands]
+build = "cat $GRANIT_DEPENDENCIES/a/hello > from-a.txt && echo 'built by b' >> from-a.txt"
+
+[outputs]
+result = "from-a.txt"

@@ -1,0 +1,17 @@
+# Example granit workspace.
+#
+# Two packages demonstrate artifact dependencies:
+#   - `a` produces a `hello` output (hello.txt).
+#   - `b` depends on `a:hello`, reads it from $GRANIT_DEPENDENCIES, and produces
+#     its own `result` output derived from a's file.
+#
+# Try:
+#   granit graph          # shows a -> b and the build order
+#   granit build b        # builds a (transitively) then b
+[workspace]
+name = "example"
+members = ["packages/*"]
+
+[nixpkgs]
+# Pinned to a nixos-24.05 branch ref; granit.lock records the exact rev.
+ref = "github:NixOS/nixpkgs/nixos-24.05"

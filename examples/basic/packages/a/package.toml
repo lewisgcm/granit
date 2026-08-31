@@ -1,0 +1,9 @@
+[package]
+name = "a"
+tools = ["coreutils"]
+
+[commands]
+build = "echo 'hello world' > hello.txt"
+
+[outputs]
+hello = "hello.txt"
