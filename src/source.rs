@@ -1,11 +1,18 @@
 //! Computes the set of a package's source files to include in the build,
-//! applying gitignore-style `exclude` patterns (rooted at the package dir) plus
-//! implicit excludes for `.git` and `.granit`.
+//! applying `exclude` patterns (rooted at the package dir) plus implicit
+//! excludes for `.git` and `.granit`.
+//!
+//! Exclude semantics are gitignore-like with one deliberate change: a plain
+//! name (e.g. `dist`) is **anchored to the package root**, so it only excludes
+//! `./dist`, not every nested directory called `dist` (which would strip, say,
+//! `node_modules/**/dist`). To match at any depth, use a glob (`**/dist`,
+//! `*.log`) or a slash-bearing path. This makes the common case — "exclude my
+//! package's build output" — behave the least-surprising way.
 //!
 //! Matching is done here in Rust (via the `ignore` crate's gitignore engine)
-//! rather than in the generated Nix, so the semantics are the familiar
-//! gitignore ones and are unit-testable. The resulting file list is emitted
-//! into the flake as an explicit `src` filter (see `nixgen`).
+//! rather than in the generated Nix, so the semantics are unit-testable. The
+//! resulting file list is emitted into the flake as an explicit `src` filter
+//! (see `nixgen`).
 
 use std::path::{Path, PathBuf};
 
@@ -18,23 +25,27 @@ pub const IMPLICIT_EXCLUDES: &[&str] = &[".git", ".granit"];
 /// Compute the package-relative paths of files to include as build source.
 ///
 /// - `dir` is the package directory.
-/// - `exclude` are gitignore-style patterns rooted at `dir`.
+/// - `exclude` are exclude patterns rooted at `dir`. A plain name is anchored
+///   to the package root; use a glob or slash-path to match at any depth.
 ///
 /// Returns a sorted list of relative paths (files only; directories are
 /// implied by their contents). Excluded directories are pruned so their
 /// contents are not walked.
 pub fn included_files(dir: &Path, exclude: &[String]) -> Result<Vec<PathBuf>> {
     // Build a gitignore matcher rooted at the package dir from the implicit
-    // excludes plus the user's patterns.
+    // excludes plus the user's patterns. Patterns are anchored to the package
+    // root by default (see `anchor_pattern`).
     let mut builder = GitignoreBuilder::new(dir);
     for pat in IMPLICIT_EXCLUDES {
+        let anchored = anchor_pattern(pat);
         builder
-            .add_line(None, pat)
+            .add_line(None, &anchored)
             .with_context(|| format!("invalid implicit exclude `{pat}`"))?;
     }
     for pat in exclude {
+        let anchored = anchor_pattern(pat);
         builder
-            .add_line(None, pat)
+            .add_line(None, &anchored)
             .with_context(|| format!("invalid exclude pattern `{pat}`"))?;
     }
     let matcher = builder
@@ -45,6 +56,27 @@ pub fn included_files(dir: &Path, exclude: &[String]) -> Result<Vec<PathBuf>> {
     walk(dir, dir, &matcher, &mut included)?;
     included.sort();
     Ok(included)
+}
+
+/// Anchor a plain exclude name to the package root.
+///
+/// gitignore treats a pattern with no `/` as matching at any depth, which is
+/// surprising for build excludes (e.g. `dist` would strip every dependency's
+/// nested `dist/`). We flip that default: a pattern that is a plain name —
+/// no leading/embedded slash and no glob metacharacter (`*`, `?`, `[`) — is
+/// prefixed with `/` so it only matches at the package root. Patterns that
+/// already contain a slash (gitignore anchors these) or use globs (the user is
+/// explicitly asking for depth/pattern matching) are left untouched.
+fn anchor_pattern(pat: &str) -> String {
+    let trimmed = pat.trim();
+    // Preserve a trailing-slash "directory only" marker while inspecting.
+    let has_glob = trimmed.contains(['*', '?', '[']);
+    let has_slash = trimmed.trim_end_matches('/').contains('/') || trimmed.starts_with('/');
+    if has_glob || has_slash {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
 }
 
 /// Recursively walk `current`, collecting included files relative to `root`,
@@ -116,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_dir_name_excludes_dir_and_contents() {
+    fn bare_name_excludes_only_root_level() {
         let tmp = tempfile::tempdir().unwrap();
         touch(&tmp.path().join("package.json"));
         touch(&tmp.path().join("node_modules/dep/index.js"));
@@ -130,27 +162,67 @@ mod tests {
     }
 
     #[test]
-    fn gitignore_style_patterns() {
+    fn bare_name_does_not_strip_nested_same_name_dirs() {
+        // Regression: `exclude = ["dist"]` must NOT remove a dependency's
+        // nested `node_modules/**/dist`, only the package's own root `dist`.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(&tmp.path().join("dist/mine.js"));
+        touch(&tmp.path().join("node_modules/@scope/pkg/dist/runner.js"));
+        touch(&tmp.path().join("node_modules/@scope/pkg/cmd/tsp.js"));
+        let files = included_files(tmp.path(), &["dist".to_string()]).unwrap();
+        // Root ./dist is gone; the nested dependency dist survives.
+        assert_eq!(
+            rels(&files),
+            vec![
+                "node_modules/@scope/pkg/cmd/tsp.js",
+                "node_modules/@scope/pkg/dist/runner.js",
+            ]
+        );
+    }
+
+    #[test]
+    fn glob_matches_any_depth() {
         let tmp = tempfile::tempdir().unwrap();
         touch(&tmp.path().join("keep.ts"));
         touch(&tmp.path().join("debug.log"));
         touch(&tmp.path().join("nested/trace.log"));
         touch(&tmp.path().join("nested/keep.ts"));
-        // `*.log` matches at any depth (gitignore semantics).
+        // `*.log` is a glob: matches at any depth (gitignore semantics).
         let files = included_files(tmp.path(), &["*.log".to_string()]).unwrap();
         assert_eq!(rels(&files), vec!["keep.ts", "nested/keep.ts"]);
     }
 
     #[test]
-    fn anchored_pattern_only_matches_root() {
+    fn double_star_glob_excludes_nested_dirs() {
+        // Opt back in to any-depth directory matching with an explicit glob.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(&tmp.path().join("dist/mine.js"));
+        touch(&tmp.path().join("node_modules/pkg/dist/runner.js"));
+        touch(&tmp.path().join("keep.ts"));
+        let files = included_files(tmp.path(), &["**/dist".to_string()]).unwrap();
+        assert_eq!(rels(&files), vec!["keep.ts"]);
+    }
+
+    #[test]
+    fn leading_slash_still_anchors_to_root() {
         let tmp = tempfile::tempdir().unwrap();
         touch(&tmp.path().join("dist/out.js"));
         touch(&tmp.path().join("sub/dist/out.js"));
-        // Leading slash anchors to the package root.
+        // Leading slash anchors to the package root (same as a bare name now).
         let files = included_files(tmp.path(), &["/dist".to_string()]).unwrap();
         assert_eq!(rels(&files), vec!["sub/dist/out.js"]);
     }
 
+    #[test]
+    fn anchor_pattern_rules() {
+        assert_eq!(anchor_pattern("dist"), "/dist");
+        assert_eq!(anchor_pattern("tsp-output"), "/tsp-output");
+        assert_eq!(anchor_pattern("/dist"), "/dist");
+        assert_eq!(anchor_pattern("**/dist"), "**/dist");
+        assert_eq!(anchor_pattern("*.log"), "*.log");
+        assert_eq!(anchor_pattern("build/cache"), "build/cache");
+        assert_eq!(anchor_pattern(" dist "), "/dist");
+    }
     #[test]
     fn implicit_excludes_git_and_granit() {
         let tmp = tempfile::tempdir().unwrap();

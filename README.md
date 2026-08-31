@@ -105,6 +105,9 @@ name = "b"
 tools = ["coreutils", "nodejs_20"]
 # Artifact dependencies on other packages, each as "package:label".
 dependencies = ["a:hello"]
+# Optional: files/directories to exclude from the build source (see below).
+# A plain name is anchored to the package root; use a glob for any depth.
+exclude = ["dist", "tsp-output"]
 
 # Labeled outputs: label = "filename produced by the build".
 # granit collects each named file into the package's output under the label.
@@ -120,6 +123,32 @@ test  = "echo 'self-contained test' > from-a.txt"
 
 `granit build --emit-only [pkg]` prints the generated flake to stdout without
 writing it; a normal build writes it to `.granit/flake.nix`.
+
+### Package source files
+
+A package's own files are copied into the build sandbox, so build commands can
+read them (e.g. `package.json`, `main.tsp`, source trees). `.git` and `.granit`
+are always excluded.
+
+Use `exclude` to keep generated or heavy directories out of the copied source:
+
+```toml
+exclude = ["dist", "tsp-output", "*.log"]
+```
+
+Exclude patterns are gitignore-like, with one deliberate difference: **a plain
+name is anchored to the package root.** So `exclude = ["dist"]` removes only the
+package's own `./dist`, not every nested directory called `dist` (which would
+otherwise strip, for example, `node_modules/**/dist` and break a `node_modules`
+you intend to copy). To match at any depth, use a glob or slash-bearing path:
+
+| Pattern      | Matches                                             |
+| ------------ | --------------------------------------------------- |
+| `dist`       | `./dist` only (package root)                        |
+| `/dist`      | `./dist` only (same as above; explicit anchor)      |
+| `**/dist`    | any directory named `dist`, at any depth            |
+| `*.log`      | any `.log` file, at any depth                       |
+| `build/tmp`  | `./build/tmp` (slash-bearing paths are anchored)    |
 
 ### Environment variables inside build commands
 
