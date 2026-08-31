@@ -71,4 +71,8 @@ pub struct PackageSection {
     /// `package:label`.
     #[serde(default)]
     pub dependencies: Vec<String>,
+    /// Gitignore-style patterns (rooted at the package directory) for files to
+    /// exclude from the build source. `.git` and `.granit` are always excluded.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }

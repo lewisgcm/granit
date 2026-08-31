@@ -44,6 +44,15 @@ pub enum Command {
     /// Print the dependency graph and resolved build order.
     Graph,
 
+    /// Search the workspace's pinned nixpkgs for build-time tools.
+    ///
+    /// Prints matching nixpkgs attribute names (usable in a package's `tools`),
+    /// their versions, and descriptions.
+    Search {
+        /// Search term, e.g. `node`, `python`, `gcc`.
+        query: String,
+    },
+
     /// Verify the environment (nix installed, flakes enabled, ...).
     Doctor,
 

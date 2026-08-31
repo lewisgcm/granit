@@ -15,6 +15,10 @@ future iteration.
 - [ ] **`build`/`test` chaining.** Optionally run a package's `build` before its
   `test` so test commands can rely on build outputs (currently each command is
   a standalone derivation phase and must be self-contained).
+- [ ] **Multi-system / cross builds.** Granit currently generates the flake for
+  exactly the host system (`builtins.currentSystem`). Add an opt-in to target
+  other systems (e.g. `granit build --system x86_64-linux`) or to emit packages
+  for a configured set of systems.
 
 ## Dependency & overlay model
 - [ ] **Package-level overlays.** Overlays are workspace-level only. Allow a
@@ -28,6 +32,12 @@ future iteration.
   synthesis for non-github flake refs (git+https, path, tarball).
 
 ## Artifacts & outputs
+- [ ] **Package source files as build inputs.** Generated derivations set
+  `dontUnpack = true` and have no `src`, so a package build can use tools and
+  consume declared dependency outputs, but cannot yet read its own source files
+  from the package directory. Add a way to bring package sources into the build
+  (e.g. copy the package dir into the sandbox, or a declared `src`/`files`
+  field), pinned for reproducibility.
 - [ ] **Post-build artifact verification.** Currently granit validates that
   referenced outputs are *declared*, but does not verify the build actually
   produced each declared file before collection (the `cp` in the install phase
@@ -43,8 +53,19 @@ future iteration.
 - [ ] **`doctor` auto-enable option.** Optionally have granit pass
   `--extra-experimental-features` (already done for granit's own invocations)
   and offer to write it to the user's `nix.conf`.
-- [ ] **`granit clean`.** Remove generated `flake.nix`/`flake.lock`/`result`
-  symlinks.
+- [ ] **`granit clean`.** Remove generated build artifacts — the `.granit/`
+  directory (generated `flake.nix`/`flake.lock`) and any `result` symlinks.
+- [ ] **Output abstraction for CLI messaging.** Progress/status output uses
+  `println!` directly across modules. Route user-facing output through a small
+  abstraction to support `--quiet`, `--verbose`, JSON output, and stderr vs
+  stdout separation.
+
+## Internal quality
+- [ ] **Cache `nix` binary resolution.** `SystemRunner::resolve_program`
+  re-scans `PATH` and the fallback profile dirs on every invocation. Resolve
+  once and cache it (minor; only matters for graphs with many invocations).
+- [ ] **Broaden integration coverage.** The nix-gated e2e test covers the happy
+  path; add gated cases for overlays, custom `run` commands, and build failures.
 
 ## Ecosystem
 - [ ] **Language recipes.** Optional higher-level helpers for common ecosystems

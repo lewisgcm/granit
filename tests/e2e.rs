@@ -146,7 +146,7 @@ fn end_to_end_build_with_nix() {
     let system = String::from_utf8_lossy(&sys_out.stdout).trim().to_string();
     assert!(!system.is_empty(), "empty system double");
 
-    let flake_dir = staged.path().join(".granit");
+    let flake_dir = staged.path().to_path_buf();
     let build_out = Command::new(nix_dir.join("nix"))
         .args([
             "--extra-experimental-features",

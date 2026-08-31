@@ -15,16 +15,16 @@ use crate::nixgen;
 use crate::runner::CommandRunner;
 use crate::workspace::{self, Workspace};
 
-/// The generated flake filename (written to the workspace root).
-/// The directory (under the workspace root) where granit writes the generated
-/// flake and its lock.
-pub const GRANIT_DIR: &str = ".granit";
-/// The generated flake filename (written inside [`GRANIT_DIR`]).
+/// The generated flake filename, written at the workspace root.
+///
+/// It must be named exactly `flake.nix` (Nix requires this) and live at the
+/// workspace root so the flake's own source tree contains the member packages
+/// — required for pure-evaluation builds that reference package sources.
 pub const FLAKE_FILE: &str = "flake.nix";
 
-/// The directory the generated flake lives in for a workspace.
+/// The directory the generated flake lives in (the workspace root).
 fn flake_dir(workspace: &Workspace) -> PathBuf {
-    workspace.root.join(GRANIT_DIR)
+    workspace.root.clone()
 }
 
 /// Determine which package (if any) contains `cwd`, given the workspace.
@@ -71,8 +71,16 @@ pub fn resolve_targets(
     Ok(workspace.packages.iter().map(|p| p.name.clone()).collect())
 }
 
+/// Discover the workspace from `cwd` and build its validated dependency graph.
+/// Centralizes the load+validate step shared by nearly every command.
+pub fn load_workspace_and_graph(cwd: &Path) -> Result<(Workspace, Graph)> {
+    let ws = workspace::discover_and_load(cwd)?;
+    let g = graph::build(&ws)?;
+    Ok((ws, g))
+}
+
 /// Query the current Nix system double (e.g. `aarch64-darwin`).
-fn current_system<R: CommandRunner>(runner: &R) -> Result<String> {
+pub fn current_system<R: CommandRunner>(runner: &R) -> Result<String> {
     let out = crate::nix::run_captured(
         runner,
         &["eval", "--impure", "--raw", "--expr", "builtins.currentSystem"],
@@ -99,10 +107,22 @@ fn write_flake(workspace: &Workspace, contents: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The result of building one package: its name, the resulting store path, and
+/// the labeled outputs available under that path (`$out/<label>`).
+#[derive(Debug, Clone)]
+pub struct BuiltPackage {
+    pub name: String,
+    pub out_path: String,
+    /// Declared output labels, sorted.
+    pub labels: Vec<String>,
+}
+
 /// The full build flow for the `build`/`test`/`run` commands.
 ///
 /// `command` is the named command each derivation runs (`build`, `test`, or a
-/// custom name). Returns the list of built package names in order.
+/// custom name). Streams Nix build logs to the terminal so the user sees build
+/// output live, then captures each package's output store path. Returns the
+/// built packages in order.
 pub fn run_build<R: CommandRunner>(
     runner: &R,
     workspace: &Workspace,
@@ -110,28 +130,33 @@ pub fn run_build<R: CommandRunner>(
     explicit_target: Option<&str>,
     command: &str,
     cwd: &Path,
-) -> Result<Vec<String>> {
-    let lock = lock::ensure_lock(workspace, runner)?;
-    let flake = nixgen::generate(workspace, graph, &lock, command)?;
-    let flake_dir = write_flake(workspace, &flake)?;
-
+) -> Result<Vec<BuiltPackage>> {
     let targets = resolve_targets(workspace, explicit_target, cwd)?;
     let system = current_system(runner)?;
+
+    let lock = lock::ensure_lock(workspace, runner)?;
+    let flake = nixgen::generate(workspace, graph, &lock, command, &system)?;
+    let flake_dir = write_flake(workspace, &flake)?;
 
     let flake_dir_str = flake_dir
         .to_str()
         .context("generated flake directory path is not valid UTF-8")?
         .to_string();
 
+    let mut built = Vec::new();
     for target in &targets {
-        // Use a `path:` flake ref so Nix treats `.granit` as a plain directory.
-        // The generated flake is gitignored, so a bare path ref would fail with
-        // "not tracked by Git" inside a repository; `path:` bypasses that.
+        // Use a `path:` flake ref so Nix treats the workspace root as a plain
+        // directory. The generated flake.nix is gitignored, so a bare path ref
+        // would fail with "not tracked by Git" inside a repository; `path:`
+        // bypasses that while still evaluating in pure mode.
         let attr = format!("path:{flake_dir_str}#packages.{system}.{target}");
         println!("granit: building `{target}` ...");
+
+        // Stream the build with `--print-build-logs` so the user sees the actual
+        // build-command output live (nix is quiet about logs by default).
         let out = crate::nix::run_streamed(
             runner,
-            &["build", &attr, "--no-link", "--print-out-paths"],
+            &["build", &attr, "--no-link", "--print-build-logs"],
             Some(&workspace.root),
         )
         .with_context(|| format!("failed to invoke `nix build` for `{target}`"))?;
@@ -141,10 +166,67 @@ pub fn run_build<R: CommandRunner>(
                 out.code
             );
         }
-        println!("granit: built `{target}`");
+
+        // The build is now in the store; query its out path without rebuilding.
+        let out_path = query_out_path(runner, &attr)
+            .with_context(|| format!("determining output path for `{target}`"))?;
+
+        let labels = workspace
+            .package(target)
+            .map(|p| p.outputs.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        println!("granit: built `{target}` -> {out_path}");
+        built.push(BuiltPackage {
+            name: target.clone(),
+            out_path,
+            labels,
+        });
     }
 
-    Ok(targets)
+    Ok(built)
+}
+
+/// Query a built flake attribute's output store path (cached; no rebuild).
+fn query_out_path<R: CommandRunner>(runner: &R, attr: &str) -> Result<String> {
+    let out = crate::nix::run_captured(
+        runner,
+        &["build", attr, "--no-link", "--print-out-paths"],
+    )
+    .context("failed to query output path from nix")?;
+    if !out.success {
+        bail!("could not determine output path:\n{}", out.stderr.trim());
+    }
+    // `--print-out-paths` may print multiple lines for multi-output derivations;
+    // take the first non-empty line.
+    let path = out
+        .stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string();
+    if path.is_empty() {
+        bail!("nix did not report an output path");
+    }
+    Ok(path)
+}
+
+/// Print a summary of where each built package's outputs live.
+fn print_output_locations(built: &[BuiltPackage]) {
+    if built.is_empty() {
+        return;
+    }
+    println!("\nOutputs:");
+    for pkg in built {
+        if pkg.labels.is_empty() {
+            println!("  {} -> {}", pkg.name, pkg.out_path);
+        } else {
+            for label in &pkg.labels {
+                println!("  {}:{} -> {}/{}", pkg.name, label, pkg.out_path, label);
+            }
+        }
+    }
 }
 
 /// Convenience entry point used by `main` for `granit build`.
@@ -153,10 +235,46 @@ pub fn build_command<R: CommandRunner>(
     explicit_target: Option<&str>,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("could not determine current directory")?;
-    let ws = workspace::discover_and_load(&cwd)?;
-    let g = graph::build(&ws)?;
+    let (ws, g) = load_workspace_and_graph(&cwd)?;
     let built = run_build(runner, &ws, &g, explicit_target, "build", &cwd)?;
     println!("granit: build complete ({} package(s))", built.len());
+    print_output_locations(&built);
+    Ok(())
+}
+
+/// Entry point for `granit graph`: print the dependency graph and build order.
+pub fn graph_command() -> Result<()> {
+    let cwd = std::env::current_dir().context("could not determine current directory")?;
+    let (ws, g) = load_workspace_and_graph(&cwd)?;
+    print!("{}", graph::render(&ws, &g));
+    Ok(())
+}
+
+/// Entry point for `granit build --emit-only`: print the generated flake for
+/// the current system without building.
+pub fn emit_command<R: CommandRunner>(runner: &R) -> Result<()> {
+    let cwd = std::env::current_dir().context("could not determine current directory")?;
+    let (ws, g) = load_workspace_and_graph(&cwd)?;
+    let lock = lock::ensure_lock(&ws, runner)?;
+    let system = current_system(runner)?;
+    let flake = nixgen::generate(&ws, &g, &lock, "build", &system)?;
+    print!("{flake}");
+    Ok(())
+}
+
+/// Entry point for `granit update`: re-resolve pinned inputs and rewrite the lock.
+pub fn update_command<R: CommandRunner>(runner: &R) -> Result<()> {
+    let cwd = std::env::current_dir().context("could not determine current directory")?;
+    let ws = workspace::discover_and_load(&cwd)?;
+    let updated = lock::update(&ws, runner)?;
+    println!(
+        "Updated {} — nixpkgs pinned to {}",
+        lock::LOCK_FILE,
+        updated.nixpkgs.locked_ref
+    );
+    for (overlay, locked) in ws.overlays.iter().zip(updated.overlays.iter()) {
+        println!("  overlay {} -> {}", overlay.source, locked.locked_ref);
+    }
     Ok(())
 }
 
@@ -194,8 +312,7 @@ pub fn run_named_command<R: CommandRunner>(
     command: &str,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("could not determine current directory")?;
-    let ws = workspace::discover_and_load(&cwd)?;
-    let g = graph::build(&ws)?;
+    let (ws, g) = load_workspace_and_graph(&cwd)?;
 
     // Validate the command exists for all resolved targets before doing work.
     let targets = resolve_targets(&ws, explicit_target, &cwd)?;
@@ -206,6 +323,7 @@ pub fn run_named_command<R: CommandRunner>(
         "granit: `{command}` complete ({} package(s))",
         done.len()
     );
+    print_output_locations(&done);
     Ok(())
 }
 
@@ -222,6 +340,7 @@ mod tests {
             dir,
             tools: vec![],
             dependencies: vec![],
+            exclude: vec![],
             outputs: BTreeMap::new(),
             commands: BTreeMap::new(),
         }

@@ -219,6 +219,7 @@ mod tests {
                     label: l.to_string(),
                 })
                 .collect(),
+            exclude: vec![],
             outputs: outputs
                 .iter()
                 .map(|o| (o.to_string(), format!("{o}.txt")))

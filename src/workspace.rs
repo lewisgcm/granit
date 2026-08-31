@@ -50,6 +50,8 @@ pub struct Package {
     pub dir: PathBuf,
     pub tools: Vec<String>,
     pub dependencies: Vec<DependencyRef>,
+    /// Gitignore-style exclude patterns for the build source (package-rooted).
+    pub exclude: Vec<String>,
     /// label -> filename produced by the build.
     pub outputs: BTreeMap<String, String>,
     /// command name -> command string.
@@ -246,6 +248,7 @@ pub fn load_package(dir: &Path) -> Result<Package> {
         dir: dir.to_path_buf(),
         tools: file.package.tools,
         dependencies,
+        exclude: file.package.exclude,
         outputs: file.outputs,
         commands: file.commands,
     })

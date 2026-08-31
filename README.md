@@ -67,6 +67,7 @@ granit build     # build all packages via nix
 | `granit test [pkg]`    | Run a package's `test` command.                                         |
 | `granit run <cmd> [pkg]` | Run a named custom command from a package's `[commands]` table.       |
 | `granit graph`         | Print the dependency graph and resolved build order.                    |
+| `granit search <query>` | Search the pinned nixpkgs for build-time tools (attribute name, version, description). |
 | `granit update`        | Re-resolve pinned inputs and rewrite `granit.lock`.                     |
 | `granit doctor`        | Verify the environment (nix installed, flakes enabled).                 |
 
@@ -100,6 +101,7 @@ ref = "github:NixOS/nixpkgs/nixpkgs-unstable"
 [package]
 name = "b"
 # Build-time tools by nixpkgs attribute name (resolved against nixpkgs + overlays).
+# Not sure of the attribute name? Run `granit search node` to find it.
 tools = ["coreutils", "nodejs_20"]
 # Artifact dependencies on other packages, each as "package:label".
 dependencies = ["a:hello"]
