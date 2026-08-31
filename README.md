@@ -117,12 +117,49 @@ result = "from-a.txt"
 [commands]
 # Commands run in a Nix-provisioned environment. Produce your declared output
 # files by their natural names — granit collects them (you never touch $out).
+# `build` and `test` have first-class subcommands (`granit build`, `granit
+# test`); any other entry is a custom command run with `granit run <name>`.
 build = "cat $GRANIT_DEPENDENCIES/a/hello > from-a.txt && echo 'built by b' >> from-a.txt"
 test  = "echo 'self-contained test' > from-a.txt"
+# A custom command — invoke with `granit run generate`.
+generate = "go generate ./..."
 ```
 
 `granit build --emit-only [pkg]` prints the generated flake to stdout without
 writing it; a normal build writes it to `.granit/flake.nix`.
+
+### Custom commands
+
+Any entry in a package's `[commands]` table can be run by name with
+`granit run <name>`. This is how you expose project-specific tasks — code
+generation, linting, formatting, packaging — through the same reproducible,
+Nix-provisioned environment your builds use (with the package's declared
+`tools` on `PATH` and its source files present).
+
+```toml
+[package]
+name = "api"
+tools = ["go"]
+
+[commands]
+build    = "go build -o server ./cmd/server"
+generate = "go generate ./..."
+lint     = "gofmt -l . && go vet ./..."
+```
+
+```sh
+granit run generate     # runs `go generate ./...`
+granit run lint         # runs the lint command
+granit run generate api # run it in a specific package from the workspace root
+```
+
+`build` and `test` are the common cases, so they get first-class subcommands
+(`granit build`, `granit test`). Every other command is invoked through
+`granit run <name>` — this keeps custom names from ever colliding with granit's
+own subcommands. A command runs in a fresh working directory as its own
+derivation and does **not** implicitly run `build` first, so make each command
+self-contained. If it produces any of the package's declared `[outputs]`, granit
+collects them; otherwise it simply runs for its effects.
 
 ### Package source files
 
