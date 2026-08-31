@@ -33,6 +33,7 @@ pub fn generate(
     graph: &Graph,
     lock: &Lock,
     command: &str,
+    targets: &[String],
     system: &str,
 ) -> anyhow::Result<String> {
     let mut w = NixWriter::new();
@@ -63,9 +64,12 @@ pub fn generate(
         w.line(&format!("outputs = {{ {} }}:", args.join(", ")));
         w.indented(|w| {
             w.line("let");
-            w.indented(|w| emit_let_bindings(w, workspace, graph, command, lock.overlays.len(), system));
+            w.indented(|w| emit_let_bindings(w, workspace, graph, command, targets, lock.overlays.len(), system));
             w.line("in {");
-            w.indented(|w| emit_packages_output(w, graph, system));
+            w.indented(|w| {
+                emit_packages_output(w, graph, system);
+                emit_devshells_output(w, workspace, graph, system);
+            });
             w.line("};");
         });
     });
@@ -81,6 +85,7 @@ fn emit_let_bindings(
     workspace: &Workspace,
     graph: &Graph,
     command: &str,
+    targets: &[String],
     overlay_count: usize,
     system: &str,
 ) {
@@ -108,10 +113,21 @@ fn emit_let_bindings(
                     let pkg = workspace
                         .package(name)
                         .expect("graph order references a known package");
+                    // The requested command applies only to the target
+                    // package(s) named on the command line; their dependencies
+                    // are always *built* (their `build` command) so their
+                    // declared outputs exist for the target to consume via
+                    // $GRANIT_DEPENDENCIES. Otherwise a `granit run <cmd>` would
+                    // try to run <cmd> on dependencies that don't define it.
+                    let pkg_command = if targets.iter().any(|t| t == name) {
+                        command
+                    } else {
+                        "build"
+                    };
                     // Emit `<attr> = <derivation>;` where the derivation is a
                     // multi-line block; open the assignment then render the body.
                     w.line(&format!("{} = final.stdenv.mkDerivation {{", nixwriter::attr(name)));
-                    w.indented(|w| emit_derivation_body(w, pkg, command, &workspace.root));
+                    w.indented(|w| emit_derivation_body(w, pkg, pkg_command, &workspace.root));
                     w.line("};");
                 }
             });
@@ -136,6 +152,79 @@ fn emit_packages_output(w: &mut NixWriter, graph: &Graph, system: &str) {
         for name in &graph.order {
             let a = nixwriter::attr(name);
             w.line(&format!("{a} = pkgs.granitPackages.{a};"));
+        }
+    });
+    w.line("};");
+}
+
+/// Emit the `devShells.<system>` output attribute: one shell per package that
+/// puts the package's `tools` on `PATH` and materializes its dependency outputs
+/// under `$GRANIT_DEPENDENCIES`. This backs *custom* commands (`granit run
+/// <cmd>`), which run in the user's real source directory (not a sandbox) so
+/// tasks like `go generate` can write back into the tree.
+fn emit_devshells_output(
+    w: &mut NixWriter,
+    workspace: &Workspace,
+    graph: &Graph,
+    system: &str,
+) {
+    w.line(&format!("devShells.{} = {{", nixwriter::attr(system)));
+    w.indented(|w| {
+        for name in &graph.order {
+            let pkg = workspace
+                .package(name)
+                .expect("graph order references a known package");
+            let a = nixwriter::attr(name);
+            w.line(&format!("{a} = pkgs.mkShell {{"));
+            w.indented(|w| {
+                // Tools on PATH (resolved against the merged package set).
+                let tools: String = pkg
+                    .tools
+                    .iter()
+                    .map(|t| format!("pkgs.{} ", nixwriter::attr(t)))
+                    .collect();
+                w.assign("packages", &format!("[ {tools}]"));
+
+                // Dependency derivations, so Nix builds them before the shell
+                // starts and we can materialize their outputs.
+                if !pkg.dependencies.is_empty() {
+                    w.line("granitDeps = [");
+                    w.indented(|w| {
+                        for dep in &pkg.dependencies {
+                            w.line(&format!(
+                                "\"{}:{}:${{pkgs.granitPackages.{}}}\"",
+                                nixwriter::escape_nix_dq(&dep.package),
+                                nixwriter::escape_nix_dq(&dep.label),
+                                nixwriter::attr(&dep.package)
+                            ));
+                        }
+                    });
+                    w.line("];");
+                }
+
+                // shellHook materializes dependency outputs into a fresh temp
+                // dir and exports GRANIT_DEPENDENCIES to it. Custom commands run
+                // via `nix develop --command`, inheriting this environment.
+                w.line("shellHook = ''");
+                w.indented(|w| {
+                    w.line("export GRANIT_DEPENDENCIES=\"$(mktemp -d)/granit-deps\"");
+                    w.line("mkdir -p \"$GRANIT_DEPENDENCIES\"");
+                    if !pkg.dependencies.is_empty() {
+                        w.line("for entry in $granitDeps; do");
+                        w.indented(|w| {
+                            w.line("depPkg=\"''${entry%%:*}\"");
+                            w.line("rest=\"''${entry#*:}\"");
+                            w.line("depLabel=\"''${rest%%:*}\"");
+                            w.line("depPath=\"''${rest#*:}\"");
+                            w.line("mkdir -p \"$GRANIT_DEPENDENCIES/$depPkg\"");
+                            w.line("cp -rL \"$depPath/$depLabel\" \"$GRANIT_DEPENDENCIES/$depPkg/$depLabel\"");
+                        });
+                        w.line("done");
+                    }
+                });
+                w.line("'';");
+            });
+            w.line("};");
         }
     });
     w.line("};");
@@ -388,7 +477,7 @@ mod tests {
         let ws = two_package_ws();
         let g = graph::build(&ws).unwrap();
         let lock = lock_for("deadbeefdeadbeef", vec![]);
-        let nix = generate(&ws, &g, &lock, "build", "x86_64-linux").unwrap();
+        let nix = generate(&ws, &g, &lock, "build", &[], "x86_64-linux").unwrap();
         assert!(
             nix.contains("nixpkgs.url = \"github:NixOS/nixpkgs/deadbeefdeadbeef\""),
             "missing pinned nixpkgs input:\n{nix}"
@@ -406,7 +495,7 @@ mod tests {
         let ws = two_package_ws();
         let g = graph::build(&ws).unwrap();
         let lock = lock_for("rev", vec![]);
-        let nix = generate(&ws, &g, &lock, "build", "x86_64-linux").unwrap();
+        let nix = generate(&ws, &g, &lock, "build", &[], "x86_64-linux").unwrap();
         assert!(
             nix.contains("buildInputs = [ final.coreutils ];"),
             "missing buildInputs:\n{nix}"
@@ -418,7 +507,7 @@ mod tests {
         let ws = two_package_ws();
         let g = graph::build(&ws).unwrap();
         let lock = lock_for("rev", vec![]);
-        let nix = generate(&ws, &g, &lock, "build", "x86_64-linux").unwrap();
+        let nix = generate(&ws, &g, &lock, "build", &[], "x86_64-linux").unwrap();
         // b's derivation references a's store path via the overlay fixpoint.
         assert!(
             nix.contains("\"a:hello:${gp.a}\""),
@@ -435,11 +524,62 @@ mod tests {
     }
 
     #[test]
+    fn custom_command_applies_only_to_target_deps_run_build() {
+        // Workspace: b depends on a. Only b is the target. Requesting a command
+        // that a does not define ("test") must NOT blank out a's build script:
+        // dependencies always run their `build` command so their outputs exist
+        // for the target to consume via $GRANIT_DEPENDENCIES.
+        let ws = two_package_ws();
+        let g = graph::build(&ws).unwrap();
+        let lock = lock_for("rev", vec![]);
+
+        let nix = generate(&ws, &g, &lock, "test", &["b".to_string()], "x86_64-linux").unwrap();
+
+        // a's actual build command must be present (a ran `build`, not `test`).
+        // The buildPhase user command is command-specific; output collection is
+        // not, so we assert on the command body itself.
+        assert!(
+            nix.contains("echo 'hello world' > hello.txt"),
+            "dependency `a` should run its build command, not the (missing) target command:\n{nix}"
+        );
+    }
+
+    #[test]
+    fn emits_devshells_with_tools_and_dep_materialization() {
+        let ws = two_package_ws();
+        let g = graph::build(&ws).unwrap();
+        let lock = lock_for("rev", vec![]);
+        let nix = generate(&ws, &g, &lock, "build", &[], "x86_64-linux").unwrap();
+
+        // A devShells output exists for the target system.
+        assert!(
+            nix.contains("devShells.x86_64-linux = {"),
+            "missing devShells output:\n{nix}"
+        );
+        // Each package gets a mkShell with its tools on PATH.
+        assert!(nix.contains("pkgs.mkShell {"), "missing mkShell:\n{nix}");
+        assert!(
+            nix.contains("packages = [ pkgs.coreutils ];"),
+            "devShell should put tools on PATH:\n{nix}"
+        );
+        // b's devShell materializes its dependency a:hello under
+        // $GRANIT_DEPENDENCIES via the shellHook.
+        assert!(
+            nix.contains("\"a:hello:${pkgs.granitPackages.a}\""),
+            "devShell should wire dependency outputs:\n{nix}"
+        );
+        assert!(
+            nix.contains("export GRANIT_DEPENDENCIES="),
+            "devShell shellHook should export GRANIT_DEPENDENCIES:\n{nix}"
+        );
+    }
+
+    #[test]
     fn collects_declared_outputs() {
         let ws = two_package_ws();
         let g = graph::build(&ws).unwrap();
         let lock = lock_for("rev", vec![]);
-        let nix = generate(&ws, &g, &lock, "build", "x86_64-linux").unwrap();
+        let nix = generate(&ws, &g, &lock, "build", &[], "x86_64-linux").unwrap();
         // a collects hello.txt -> $out/hello
         assert!(
             nix.contains("cp -rL 'hello.txt' \"$out/hello\""),
@@ -480,7 +620,7 @@ mod tests {
                 },
             ],
         );
-        let nix = generate(&ws, &g, &lock, "build", "x86_64-linux").unwrap();
+        let nix = generate(&ws, &g, &lock, "build", &[], "x86_64-linux").unwrap();
         assert!(nix.contains("granitOverlay0.url = \"github:acme/first/1111\""));
         assert!(nix.contains("granitOverlay1.url = \"github:acme/second/2222\""));
         // Overlay 0 must appear before overlay 1 in the composed list.
@@ -510,7 +650,7 @@ mod tests {
         };
         let g = graph::build(&ws).unwrap();
         let lock = lock_for("rev", vec![]);
-        let nix = generate(&ws, &g, &lock, "build", "x86_64-linux").unwrap();
+        let nix = generate(&ws, &g, &lock, "build", &[], "x86_64-linux").unwrap();
         assert!(
             nix.contains("echo ''${HOME} > o.txt"),
             "interpolation not escaped:\n{nix}"

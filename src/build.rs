@@ -135,7 +135,7 @@ pub fn run_build<R: CommandRunner>(
     let system = current_system(runner)?;
 
     let lock = lock::ensure_lock(workspace, runner)?;
-    let flake = nixgen::generate(workspace, graph, &lock, command, &system)?;
+    let flake = nixgen::generate(workspace, graph, &lock, command, &targets, &system)?;
     let flake_dir = write_flake(workspace, &flake)?;
 
     let flake_dir_str = flake_dir
@@ -257,7 +257,9 @@ pub fn emit_command<R: CommandRunner>(runner: &R) -> Result<()> {
     let (ws, g) = load_workspace_and_graph(&cwd)?;
     let lock = lock::ensure_lock(&ws, runner)?;
     let system = current_system(runner)?;
-    let flake = nixgen::generate(&ws, &g, &lock, "build", &system)?;
+    // Emit the full build variant: with command "build", every package (target
+    // or dependency) runs its build command, so the targets set is immaterial.
+    let flake = nixgen::generate(&ws, &g, &lock, "build", &[], &system)?;
     print!("{flake}");
     Ok(())
 }
@@ -304,8 +306,14 @@ fn ensure_command_present(
     Ok(())
 }
 
-/// Entry point for `granit test` and `granit run <cmd>`: run a named command in
-/// the target package(s), erroring if the command is not defined.
+/// Entry point for `granit test` and `granit run <cmd>`.
+///
+/// `build` and `test` run as hermetic Nix derivations (sandboxed, outputs
+/// collected). Any *other* command is a custom dev task: it runs in the
+/// package's real source directory via `nix develop`, with the package's
+/// `tools` on `PATH` and dependency outputs under `$GRANIT_DEPENDENCIES`, so
+/// tasks like `go generate` can write back into the working tree. Custom
+/// commands do not collect `[outputs]`.
 pub fn run_named_command<R: CommandRunner>(
     runner: &R,
     explicit_target: Option<&str>,
@@ -318,12 +326,68 @@ pub fn run_named_command<R: CommandRunner>(
     let targets = resolve_targets(&ws, explicit_target, &cwd)?;
     ensure_command_present(&ws, &targets, command)?;
 
-    let done = run_build(runner, &ws, &g, explicit_target, command, &cwd)?;
-    println!(
-        "granit: `{command}` complete ({} package(s))",
-        done.len()
-    );
-    print_output_locations(&done);
+    // `build`/`test` are hermetic derivations; everything else runs in-place.
+    if command == "build" || command == "test" {
+        let done = run_build(runner, &ws, &g, explicit_target, command, &cwd)?;
+        println!("granit: `{command}` complete ({} package(s))", done.len());
+        print_output_locations(&done);
+        return Ok(());
+    }
+
+    run_dev_command(runner, &ws, &g, &targets, command)
+}
+
+/// Run a custom command in each target package's real source directory using a
+/// generated per-package devShell (tools on PATH, `$GRANIT_DEPENDENCIES` set).
+fn run_dev_command<R: CommandRunner>(
+    runner: &R,
+    workspace: &Workspace,
+    graph: &Graph,
+    targets: &[String],
+    command: &str,
+) -> Result<()> {
+    let system = current_system(runner)?;
+    let lock = lock::ensure_lock(workspace, runner)?;
+
+    // Generate the flake. Command/targets here only affect the `packages`
+    // (build-variant) derivations that devShells depend on for materializing
+    // dependency outputs, so build everything with `build`.
+    let flake = nixgen::generate(workspace, graph, &lock, "build", &[], &system)?;
+    let flake_dir = write_flake(workspace, &flake)?;
+    let flake_dir_str = flake_dir
+        .to_str()
+        .context("generated flake directory path is not valid UTF-8")?
+        .to_string();
+
+    for target in targets {
+        let pkg = workspace
+            .package(target)
+            .expect("target was resolved from the workspace");
+        let user_cmd = pkg
+            .commands
+            .get(command)
+            .expect("command presence was validated");
+
+        let shell_ref = format!("path:{flake_dir_str}#devShells.{system}.{target}");
+        println!("granit: running `{command}` in `{target}` ({}) ...", pkg.dir.display());
+
+        // `nix develop <shell> --command sh -c '<cmd>'` runs the command with
+        // the devShell environment active, in the package's real directory.
+        let out = crate::nix::run_streamed(
+            runner,
+            &["develop", &shell_ref, "--command", "sh", "-c", user_cmd],
+            Some(&pkg.dir),
+        )
+        .with_context(|| format!("failed to run `{command}` in `{target}`"))?;
+        if !out.success {
+            bail!(
+                "command `{command}` failed in package `{target}` (exit {:?})",
+                out.code
+            );
+        }
+    }
+
+    println!("granit: `{command}` complete ({} package(s))", targets.len());
     Ok(())
 }
 

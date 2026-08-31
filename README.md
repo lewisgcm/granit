@@ -131,10 +131,9 @@ writing it; a normal build writes it to `.granit/flake.nix`.
 ### Custom commands
 
 Any entry in a package's `[commands]` table can be run by name with
-`granit run <name>`. This is how you expose project-specific tasks — code
-generation, linting, formatting, packaging — through the same reproducible,
-Nix-provisioned environment your builds use (with the package's declared
-`tools` on `PATH` and its source files present).
+`granit run <name>`. This is how you expose project-specific dev tasks — code
+generation, linting, formatting — using the same reproducible, Nix-provisioned
+toolchain your builds use (the package's declared `tools` on `PATH`).
 
 ```toml
 [package]
@@ -153,13 +152,26 @@ granit run lint         # runs the lint command
 granit run generate api # run it in a specific package from the workspace root
 ```
 
-`build` and `test` are the common cases, so they get first-class subcommands
-(`granit build`, `granit test`). Every other command is invoked through
-`granit run <name>` — this keeps custom names from ever colliding with granit's
-own subcommands. A command runs in a fresh working directory as its own
-derivation and does **not** implicitly run `build` first, so make each command
-self-contained. If it produces any of the package's declared `[outputs]`, granit
-collects them; otherwise it simply runs for its effects.
+**Two execution models.** `build` and `test` are the common cases and get
+first-class subcommands (`granit build`, `granit test`); every other command is
+invoked through `granit run <name>` (which also keeps custom names from
+colliding with granit's own subcommands). They run differently:
+
+| Command             | Runs as                        | Working directory        | `[outputs]` |
+| ------------------- | ------------------------------ | ------------------------ | ----------- |
+| `build`, `test`     | a hermetic Nix derivation      | a sandboxed copy of src  | collected   |
+| `granit run <name>` | a command in a `nix develop`   | your **real** source dir | not collected |
+
+So `granit run generate` runs **in place** in your package directory — a task
+like `go generate` writes its output back into your working tree, exactly as if
+you ran it yourself, but with the pinned toolchain on `PATH`. `build`/`test`
+stay sandboxed and hermetic (their declared `[outputs]` are collected into the
+Nix store).
+
+In both models, a declared dependency's output is available at
+`$GRANIT_DEPENDENCIES/<package>/<label>` (dependencies are always *built* first),
+and each command is self-contained — running a command does **not** implicitly
+run `build` first.
 
 ### Package source files
 
