@@ -3,19 +3,22 @@
 A simple monorepo build tool that wraps Nix flakes.
 
 Granit lets you define a workspace and its packages in TOML. You declare
-build-time tools by name (pulled from nixpkgs), label the artifacts each package
-produces, and declare artifact dependencies between packages. Granit generates a
-`flake.nix`, manages a `granit.lock` for reproducibility, and shells out to
-`nix build` — wrapping Nix's complexity behind a familiar, ergonomic format.
+build-time tools by name (pulled from nixpkgs), label the outputs each package
+produces (a built *artifact* or its *source* tree), and declare dependencies
+between packages. Granit generates a `flake.nix`, manages a `granit.lock` for
+reproducibility, and shells out to `nix build` — wrapping Nix's complexity
+behind a familiar, ergonomic format.
 
 ## Goals
 
 1. **Simplified interface over nixpkgs.** Bring in build-time tools (java, node,
    gcc, …) by attribute name and get reproducible builds without writing Nix.
-2. **Artifact dependencies between packages.** Package A produces file F; package
-   B consumes it. Granit knows that building B requires building A first.
+2. **Dependencies between packages.** Package A produces something (a built
+   *artifact*, or its *source* tree); package B depends on it. Granit builds A
+   first when needed and mounts its output into B the right way — artifacts at
+   `$GRANIT_DEPENDENCIES`, source repo-relative for compile-together libraries.
 3. **Familiar syntax.** Concepts you already know: workspaces, dependencies,
-   and labeled outputs (artifacts).
+   and labeled outputs (artifacts or shared source).
 
 ## Requirements
 
@@ -233,6 +236,25 @@ build = "go build -o bin/app ."
 For **build-required** libraries (TypeScript compiled to `dist/`, a Java
 `.jar`), use an `artifact` output instead: the producer is built first and the
 consumer reads the built result from `$GRANIT_DEPENDENCIES`.
+
+**Which kind for which language?** The rule of thumb: if the consumer's compiler
+links the library *from source*, use `source`; if it links a *built* artifact,
+use `artifact`.
+
+| Ecosystem                                   | Shared library as… | Consumer wiring                                   |
+| ------------------------------------------- | ------------------ | ------------------------------------------------- |
+| Go                                          | `source`           | `replace mymod => ../common` (or `go.work`)       |
+| Rust                                        | `source`           | `common = { path = "../common" }`                 |
+| Python (pure)                               | `source`           | editable/path dep, or `PYTHONPATH`                |
+| Node (plain JS)                             | `source`           | `"common": "file:../common"` or workspaces        |
+| Node (TypeScript compiled to `dist/`)       | `artifact`         | depend on `common:dist`, read `$GRANIT_DEPENDENCIES` |
+| Java / Kotlin / .NET                        | `artifact`         | depend on `common:jar`, put it on the classpath   |
+
+Source dependencies work the same in a hermetic `granit build` (granit copies
+the sibling source into the sandbox at its repo-relative path) and in
+`granit run <cmd>` dev commands (which run in your real tree, where the sibling
+already exists). Either way your language's own path-based resolution does the
+linking — granit just makes sure the source is where that resolution expects it.
 
 ### Package source files
 
