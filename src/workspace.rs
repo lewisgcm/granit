@@ -52,10 +52,20 @@ pub struct Package {
     pub dependencies: Vec<DependencyRef>,
     /// Gitignore-style exclude patterns for the build source (package-rooted).
     pub exclude: Vec<String>,
-    /// label -> filename produced by the build.
-    pub outputs: BTreeMap<String, String>,
+    /// label -> declared output (path + kind).
+    pub outputs: BTreeMap<String, Output>,
     /// command name -> command string.
     pub commands: BTreeMap<String, String>,
+}
+
+/// A processed, labeled package output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    /// Path relative to the package root that this output refers to.
+    pub path: String,
+    /// Whether this is a *source* output (mounted repo-relative as compile-time
+    /// source) rather than a built *artifact* (collected file/dir).
+    pub is_source: bool,
 }
 
 /// A resolved overlay source (flake ref).
@@ -243,13 +253,28 @@ pub fn load_package(dir: &Path) -> Result<Package> {
         dependencies.push(parsed);
     }
 
+    // Convert raw output specs into processed outputs (path + kind).
+    let outputs = file
+        .outputs
+        .into_iter()
+        .map(|(label, spec)| {
+            (
+                label,
+                Output {
+                    path: spec.path().to_string(),
+                    is_source: spec.is_source(),
+                },
+            )
+        })
+        .collect();
+
     Ok(Package {
         name,
         dir: dir.to_path_buf(),
         tools: file.package.tools,
         dependencies,
         exclude: file.package.exclude,
-        outputs: file.outputs,
+        outputs,
         commands: file.commands,
     })
 }
@@ -335,7 +360,8 @@ build = "cat $GRANIT_DEPENDENCIES/a/hello > from-a.txt"
         assert_eq!(ws.packages.len(), 2);
         let a = ws.package("a").unwrap();
         assert_eq!(a.tools, vec!["coreutils"]);
-        assert_eq!(a.outputs.get("hello").unwrap(), "hello.txt");
+        assert_eq!(a.outputs.get("hello").unwrap().path, "hello.txt");
+        assert!(!a.outputs.get("hello").unwrap().is_source);
         let b = ws.package("b").unwrap();
         assert_eq!(b.dependencies.len(), 1);
         assert_eq!(b.dependencies[0].package, "a");

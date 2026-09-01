@@ -109,8 +109,9 @@ dependencies = ["a:hello"]
 # A plain name is anchored to the package root; use a glob for any depth.
 exclude = ["dist", "tsp-output"]
 
-# Labeled outputs: label = "filename produced by the build".
-# granit collects each named file into the package's output under the label.
+# Labeled outputs. A bare string is an *artifact* (a built file/dir collected
+# under the label). A `{ source = "." }` output exposes the package's source
+# tree to consumers as compile-time source (see "Outputs & dependency kinds").
 [outputs]
 result = "from-a.txt"
 
@@ -172,6 +173,66 @@ In both models, a declared dependency's output is available at
 `$GRANIT_DEPENDENCIES/<package>/<label>` (dependencies are always *built* first),
 and each command is self-contained — running a command does **not** implicitly
 run `build` first.
+
+### Outputs & dependency kinds
+
+An `[outputs]` entry declares something a package produces, under a label.
+There are two *kinds*, and the **producer** decides which — a consumer just
+depends on `package:label` and granit mounts it the right way.
+
+```toml
+[outputs]
+# Artifact (the default): a built file or directory. A bare string is shorthand
+# for `{ artifact = "..." }`.
+schema  = "tsp-output/schema/openapi.yaml"
+bundle  = { artifact = "dist/lib.js" }
+
+# Source: the package's source tree, exposed to consumers as compile-time
+# source. The path is usually ".".
+src     = { source = "." }
+```
+
+How each kind is mounted into a consumer that depends on it:
+
+| Output kind         | Consumer sees it at                         | Producer is… | Typical use |
+| ------------------- | ------------------------------------------- | ------------ | ----------- |
+| `artifact` (or bare string) | `$GRANIT_DEPENDENCIES/<pkg>/<label>` | built first  | a compiled binary, a generated schema, a `dist/` bundle, a `.jar` |
+| `source`            | mounted **repo-relative** as a sibling dir  | not built    | a shared **source** library compiled *with* the consumer |
+
+A **source dependency** is the answer to "package B needs package A's *source*
+to compile against" — a Go/Rust/Python/plain-JS shared library. granit copies
+A's source tree into B's build at A's real repo-relative location (e.g.
+`../common`), so B's own language tooling resolves it by path exactly as it does
+in your working tree:
+
+```toml
+# packages/common/package.toml  — a Go source library
+[package]
+name = "common"
+tools = ["go"]
+[outputs]
+src = { source = "." }          # "my output is my source"
+
+# packages/app/package.toml  — depends on common's SOURCE
+[package]
+name = "app"
+tools = ["go"]
+dependencies = ["common:src"]   # one list; granit mounts by kind
+[outputs]
+app = { artifact = "bin/app" }
+[commands]
+build = "go build -o bin/app ."
+```
+
+```go
+// packages/app/go.mod keeps the ordinary monorepo config — same for your IDE:
+//   require example.com/common v0.0.0
+//   replace example.com/common => ../common
+```
+
+For **build-required** libraries (TypeScript compiled to `dist/`, a Java
+`.jar`), use an `artifact` output instead: the producer is built first and the
+consumer reads the built result from `$GRANIT_DEPENDENCIES`.
 
 ### Package source files
 

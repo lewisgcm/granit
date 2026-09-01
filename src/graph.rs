@@ -1,8 +1,10 @@
-//! Artifact-dependency graph over workspace packages.
+//! Dependency graph over workspace packages.
 //!
-//! Edges are derived from each package's `dependencies` (`package:label`).
-//! Provides reference validation (package + label must exist), cycle
-//! detection, and a topological build order.
+//! Edges are derived from each package's `dependencies` (`package:label`),
+//! covering both artifact and source dependencies (both require the producer
+//! to be available before the consumer builds). Provides reference validation
+//! (package + label must exist), cycle detection, and a topological build
+//! order.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -222,7 +224,15 @@ mod tests {
             exclude: vec![],
             outputs: outputs
                 .iter()
-                .map(|o| (o.to_string(), format!("{o}.txt")))
+                .map(|o| {
+                    (
+                        o.to_string(),
+                        crate::workspace::Output {
+                            path: format!("{o}.txt"),
+                            is_source: false,
+                        },
+                    )
+                })
                 .collect(),
             commands: BTreeMap::new(),
         }

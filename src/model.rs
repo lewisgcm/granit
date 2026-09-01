@@ -52,12 +52,63 @@ pub struct OverlaySection {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PackageFile {
     pub package: PackageSection,
-    /// Labeled outputs: label -> filename produced by the build.
+    /// Labeled outputs: label -> what the build produces under that label.
+    ///
+    /// Each value is either a bare string (shorthand for an *artifact* at that
+    /// path — the historical form) or a tagged table declaring the output
+    /// *kind*: `{ artifact = "path" }` or `{ source = "path" }`. A `source`
+    /// output makes the package's tree available to consumers as compile-time
+    /// source (mounted repo-relative) rather than as a built artifact file.
     #[serde(default)]
-    pub outputs: BTreeMap<String, String>,
+    pub outputs: BTreeMap<String, OutputSpec>,
     /// Named commands (e.g. `build`, `test`, custom).
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
+}
+
+/// The declared kind and path of a single labeled output.
+///
+/// Deserializes from either:
+/// - a bare string `label = "path"` → an artifact at `path` (back-compat), or
+/// - a tagged table `label = { artifact = "path" }` / `{ source = "path" }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum OutputSpec {
+    /// Bare string shorthand: an artifact produced at this path.
+    Artifact(String),
+    /// Tagged table selecting the output kind explicitly.
+    Tagged(OutputKind),
+}
+
+/// The explicit, tagged form of an output declaration. Exactly one variant key
+/// (`artifact` or `source`) is present in the TOML table.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputKind {
+    /// A built artifact (file or directory) at this path, collected into the
+    /// dependency's materialized output and consumed at
+    /// `$GRANIT_DEPENDENCIES/<pkg>/<label>`.
+    Artifact(String),
+    /// The package's source, made available to consumers as compile-time source
+    /// (mounted into the consumer's sandbox at the package's repo-relative
+    /// location). The path is relative to the package root (usually `"."`).
+    Source(String),
+}
+
+impl OutputSpec {
+    /// The output path (relative to the package root) regardless of kind.
+    pub fn path(&self) -> &str {
+        match self {
+            OutputSpec::Artifact(p) => p,
+            OutputSpec::Tagged(OutputKind::Artifact(p)) => p,
+            OutputSpec::Tagged(OutputKind::Source(p)) => p,
+        }
+    }
+
+    /// Whether this output is a source output (vs a built artifact).
+    pub fn is_source(&self) -> bool {
+        matches!(self, OutputSpec::Tagged(OutputKind::Source(_)))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -67,12 +118,89 @@ pub struct PackageSection {
     /// package set: nixpkgs + overlays + workspace overlay).
     #[serde(default)]
     pub tools: Vec<String>,
-    /// Artifact dependencies on other workspace packages, each in the form
-    /// `package:label`.
+    /// Dependencies on other workspace packages, each in the form
+    /// `package:label`. The referenced output's *kind* (artifact vs source)
+    /// determines how granit mounts it into this package's build.
     #[serde(default)]
     pub dependencies: Vec<String>,
     /// Gitignore-style patterns (rooted at the package directory) for files to
     /// exclude from the build source. `.git` and `.granit` are always excluded.
     #[serde(default)]
     pub exclude: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml_str: &str) -> PackageFile {
+        toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn bare_string_output_is_artifact_backcompat() {
+        let f = parse(
+            r#"
+[package]
+name = "a"
+
+[outputs]
+hello = "hello.txt"
+"#,
+        );
+        let out = f.outputs.get("hello").unwrap();
+        assert_eq!(out, &OutputSpec::Artifact("hello.txt".into()));
+        assert_eq!(out.path(), "hello.txt");
+        assert!(!out.is_source());
+    }
+
+    #[test]
+    fn tagged_artifact_output() {
+        let f = parse(
+            r#"
+[package]
+name = "a"
+
+[outputs]
+schema = { artifact = "tsp-output/schema/openapi.yaml" }
+"#,
+        );
+        let out = f.outputs.get("schema").unwrap();
+        assert!(!out.is_source());
+        assert_eq!(out.path(), "tsp-output/schema/openapi.yaml");
+    }
+
+    #[test]
+    fn tagged_source_output() {
+        let f = parse(
+            r#"
+[package]
+name = "common"
+
+[outputs]
+src = { source = "." }
+"#,
+        );
+        let out = f.outputs.get("src").unwrap();
+        assert!(out.is_source());
+        assert_eq!(out.path(), ".");
+    }
+
+    #[test]
+    fn mixed_outputs_in_one_package() {
+        let f = parse(
+            r#"
+[package]
+name = "lib"
+
+[outputs]
+src = { source = "." }
+bundle = { artifact = "dist/lib.js" }
+legacy = "old.txt"
+"#,
+        );
+        assert!(f.outputs.get("src").unwrap().is_source());
+        assert!(!f.outputs.get("bundle").unwrap().is_source());
+        assert!(!f.outputs.get("legacy").unwrap().is_source());
+    }
 }

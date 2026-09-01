@@ -123,7 +123,7 @@ mod tests {
         let hello = ws.package("hello").unwrap();
         assert!(hello.commands.contains_key("build"));
         assert!(hello.commands.contains_key("test"));
-        assert_eq!(hello.outputs.get("message").unwrap(), "message.txt");
+        assert_eq!(hello.outputs.get("message").unwrap().path, "message.txt");
     }
 
     #[test]

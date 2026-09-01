@@ -24,6 +24,48 @@ pub fn command_for<'a>(package: &'a Package, command: &str) -> Option<&'a str> {
     package.commands.get(command).map(|s| s.as_str())
 }
 
+/// Compute the path from `consumer`'s package dir to `producer_name`'s package
+/// dir, relative to the consumer (e.g. `../common`). Used to mount a source
+/// dependency at the sibling location the repo layout implies, so the
+/// consumer's language tooling resolves it by path exactly as in the real tree.
+///
+/// Falls back to `../<producer>` if either dir can't be made relative.
+fn sibling_rel_path(workspace: &Workspace, consumer: &Package, producer_name: &str) -> String {
+    let producer_dir = match workspace.package(producer_name) {
+        Some(p) => &p.dir,
+        None => return format!("../{producer_name}"),
+    };
+    let rel = pathdiff_rel(&consumer.dir, producer_dir)
+        .unwrap_or_else(|| format!("../{producer_name}"));
+    rel
+}
+
+/// Minimal relative-path computation from `from` to `to` (both absolute or both
+/// under the same root). Returns `None` if it can't be computed.
+fn pathdiff_rel(from: &std::path::Path, to: &std::path::Path) -> Option<String> {
+    use std::path::Component;
+    let from_comps: Vec<Component> = from.components().collect();
+    let to_comps: Vec<Component> = to.components().collect();
+    // Find common prefix length.
+    let mut i = 0;
+    while i < from_comps.len() && i < to_comps.len() && from_comps[i] == to_comps[i] {
+        i += 1;
+    }
+    let ups = from_comps.len() - i;
+    let mut parts: Vec<String> = Vec::new();
+    for _ in 0..ups {
+        parts.push("..".to_string());
+    }
+    for c in &to_comps[i..] {
+        parts.push(c.as_os_str().to_string_lossy().replace('\\', "/"));
+    }
+    if parts.is_empty() {
+        Some(".".to_string())
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
 /// Generate the full `flake.nix` text for a workspace, targeting exactly
 /// `system` (e.g. `aarch64-darwin`).
 ///
@@ -127,7 +169,7 @@ fn emit_let_bindings(
                     // Emit `<attr> = <derivation>;` where the derivation is a
                     // multi-line block; open the assignment then render the body.
                     w.line(&format!("{} = final.stdenv.mkDerivation {{", nixwriter::attr(name)));
-                    w.indented(|w| emit_derivation_body(w, pkg, pkg_command, &workspace.root));
+                    w.indented(|w| emit_derivation_body(w, workspace, pkg, pkg_command, &workspace.root));
                     w.line("};");
                 }
             });
@@ -185,12 +227,26 @@ fn emit_devshells_output(
                     .collect();
                 w.assign("packages", &format!("[ {tools}]"));
 
-                // Dependency derivations, so Nix builds them before the shell
-                // starts and we can materialize their outputs.
-                if !pkg.dependencies.is_empty() {
+                // Artifact dependency derivations, so Nix builds them before the
+                // shell starts and we can materialize their outputs. Source
+                // dependencies are NOT materialized here: dev commands run in
+                // the real source tree, where the sibling package already
+                // exists at its repo-relative path.
+                let artifact_deps: Vec<&crate::workspace::DependencyRef> = pkg
+                    .dependencies
+                    .iter()
+                    .filter(|dep| {
+                        !workspace
+                            .package(&dep.package)
+                            .and_then(|p| p.outputs.get(&dep.label))
+                            .map(|o| o.is_source)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                if !artifact_deps.is_empty() {
                     w.line("granitDeps = [");
                     w.indented(|w| {
-                        for dep in &pkg.dependencies {
+                        for dep in &artifact_deps {
                             w.line(&format!(
                                 "\"{}:{}:${{pkgs.granitPackages.{}}}\"",
                                 nixwriter::escape_nix_dq(&dep.package),
@@ -202,14 +258,14 @@ fn emit_devshells_output(
                     w.line("];");
                 }
 
-                // shellHook materializes dependency outputs into a fresh temp
-                // dir and exports GRANIT_DEPENDENCIES to it. Custom commands run
-                // via `nix develop --command`, inheriting this environment.
+                // shellHook materializes artifact dependency outputs into a
+                // fresh temp dir and exports GRANIT_DEPENDENCIES to it. Custom
+                // commands run via `nix develop --command`, inheriting this env.
                 w.line("shellHook = ''");
                 w.indented(|w| {
                     w.line("export GRANIT_DEPENDENCIES=\"$(mktemp -d)/granit-deps\"");
                     w.line("mkdir -p \"$GRANIT_DEPENDENCIES\"");
-                    if !pkg.dependencies.is_empty() {
+                    if !artifact_deps.is_empty() {
                         w.line("for entry in $granitDeps; do");
                         w.indented(|w| {
                             w.line("depPkg=\"''${entry%%:*}\"");
@@ -232,7 +288,13 @@ fn emit_devshells_output(
 
 /// Emit the body of a package's `stdenv.mkDerivation { ... }` (the caller has
 /// already written the opening `mkDerivation {` line).
-fn emit_derivation_body(w: &mut NixWriter, pkg: &Package, command: &str, root: &std::path::Path) {
+fn emit_derivation_body(
+    w: &mut NixWriter,
+    workspace: &Workspace,
+    pkg: &Package,
+    command: &str,
+    root: &std::path::Path,
+) {
     w.assign_string("pname", &pkg.name);
     w.assign_string("version", "0.0.0");
 
@@ -249,11 +311,33 @@ fn emit_derivation_body(w: &mut NixWriter, pkg: &Package, command: &str, root: &
         .collect();
     w.assign("buildInputs", &format!("[ {inputs}]"));
 
-    // Pass dependency derivations so Nix wires build order and store paths.
-    if !pkg.dependencies.is_empty() {
+    // Split dependencies into artifact deps (materialized under
+    // $GRANIT_DEPENDENCIES) and source deps (mounted repo-relative as sibling
+    // source trees, so the consumer's language tooling resolves them by path).
+    let mut artifact_deps: Vec<&crate::workspace::DependencyRef> = Vec::new();
+    let mut source_deps: Vec<(&crate::workspace::DependencyRef, String)> = Vec::new();
+    for dep in &pkg.dependencies {
+        let is_source = workspace
+            .package(&dep.package)
+            .and_then(|p| p.outputs.get(&dep.label))
+            .map(|o| o.is_source)
+            .unwrap_or(false);
+        if is_source {
+            // Path from the consumer's package dir to the producer's package
+            // dir (e.g. `../common`), so the mounted tree preserves the repo
+            // layout the language tool expects.
+            let target = sibling_rel_path(workspace, pkg, &dep.package);
+            source_deps.push((dep, target));
+        } else {
+            artifact_deps.push(dep);
+        }
+    }
+
+    // Pass artifact dependency derivations so Nix wires build order and paths.
+    if !artifact_deps.is_empty() {
         w.line("granitDeps = [");
         w.indented(|w| {
-            for dep in &pkg.dependencies {
+            for dep in &artifact_deps {
                 // Entry format "pkg:label:<storePath>"; ${gp.<pkg>} is intended
                 // Nix interpolation of the dependency's out path.
                 w.line(&format!(
@@ -261,6 +345,24 @@ fn emit_derivation_body(w: &mut NixWriter, pkg: &Package, command: &str, root: &
                     nixwriter::escape_nix_dq(&dep.package),
                     nixwriter::escape_nix_dq(&dep.label),
                     nixwriter::attr(&dep.package)
+                ));
+            }
+        });
+        w.line("];");
+    }
+
+    // Pass source dependency derivations; each entry carries the producer's
+    // collected source path and the sibling location to mount it at.
+    if !source_deps.is_empty() {
+        w.line("granitSourceDeps = [");
+        w.indented(|w| {
+            for (dep, target) in &source_deps {
+                // Entry format "<targetRelPath>:<storePath>/<label>".
+                w.line(&format!(
+                    "\"{}:${{gp.{}}}/{}\"",
+                    nixwriter::escape_nix_dq(target),
+                    nixwriter::attr(&dep.package),
+                    nixwriter::escape_nix_dq(&dep.label)
                 ));
             }
         });
@@ -288,7 +390,7 @@ fn emit_derivation_body(w: &mut NixWriter, pkg: &Package, command: &str, root: &
         w.line("export TERM=\"dumb\"");
         w.line("export GRANIT_DEPENDENCIES=\"$NIX_BUILD_TOP/granit-deps\"");
         w.line("mkdir -p \"$GRANIT_DEPENDENCIES\"");
-        if !pkg.dependencies.is_empty() {
+        if !artifact_deps.is_empty() {
             // `''${...}` escapes Nix interpolation so the shell sees `${...}`.
             w.line("for entry in $granitDeps; do");
             w.indented(|w| {
@@ -298,6 +400,21 @@ fn emit_derivation_body(w: &mut NixWriter, pkg: &Package, command: &str, root: &
                 w.line("depPath=\"''${rest#*:}\"");
                 w.line("mkdir -p \"$GRANIT_DEPENDENCIES/$depPkg\"");
                 w.line("cp -rL \"$depPath/$depLabel\" \"$GRANIT_DEPENDENCIES/$depPkg/$depLabel\"");
+            });
+            w.line("done");
+        }
+        if !source_deps.is_empty() {
+            // Mount each source dependency's tree at its repo-relative sibling
+            // location so the language's own path-based resolution finds it
+            // (e.g. a Go/Rust/Node `replace`/path dependency on `../common`).
+            w.line("for entry in $granitSourceDeps; do");
+            w.indented(|w| {
+                w.line("srcTarget=\"''${entry%%:*}\"");
+                w.line("srcPath=\"''${entry#*:}\"");
+                w.line("mkdir -p \"$(dirname \"$srcTarget\")\"");
+                // Copy writable so tooling (e.g. codegen) can operate if needed.
+                w.line("cp -rL \"$srcPath\" \"$srcTarget\"");
+                w.line("chmod -R u+w \"$srcTarget\"");
             });
             w.line("done");
         }
@@ -317,10 +434,14 @@ fn emit_derivation_body(w: &mut NixWriter, pkg: &Package, command: &str, root: &
         w.line("runHook preInstall");
         w.line("set -euo pipefail");
         w.line("mkdir -p \"$out\"");
-        for (label, filename) in &pkg.outputs {
+        for (label, output) in &pkg.outputs {
+            // Both artifact and source outputs are collected into $out/<label>.
+            // For a source output, `output.path` is typically "." (the whole
+            // unpacked source tree); consumers mount it repo-relative rather
+            // than reading it from $GRANIT_DEPENDENCIES.
             w.line(&format!(
                 "cp -rL {} \"$out/{}\"",
-                nixwriter::shell_single_quote(filename),
+                nixwriter::shell_single_quote(&output.path),
                 nixwriter::escape_nix_multiline(label)
             ));
         }
@@ -427,7 +548,15 @@ mod tests {
             exclude: vec![],
             outputs: outputs
                 .iter()
-                .map(|(l, f)| (l.to_string(), f.to_string()))
+                .map(|(l, f)| {
+                    (
+                        l.to_string(),
+                        crate::workspace::Output {
+                            path: f.to_string(),
+                            is_source: false,
+                        },
+                    )
+                })
                 .collect(),
             commands: cmds,
         }
@@ -572,6 +701,63 @@ mod tests {
             nix.contains("export GRANIT_DEPENDENCIES="),
             "devShell shellHook should export GRANIT_DEPENDENCIES:\n{nix}"
         );
+    }
+
+    #[test]
+    fn source_dependency_is_mounted_repo_relative_not_in_granit_deps() {
+        // common exposes a `source` output; app depends on `common:src`.
+        let common = pkg("common", &["go"], &[], &[("src", ".")], "go build ./...");
+        // Mark common's `src` output as a source output.
+        let mut common = common;
+        common.outputs.get_mut("src").unwrap().is_source = true;
+
+        let app = pkg(
+            "app",
+            &["go"],
+            &[("common", "src")],
+            &[],
+            "go build ./...",
+        );
+
+        let ws = Workspace {
+            name: "src-dep".into(),
+            root: PathBuf::from("/tmp/wsroot"),
+            nixpkgs_ref: "github:NixOS/nixpkgs/nixpkgs-unstable".into(),
+            overlays: vec![],
+            packages: vec![
+                {
+                    let mut c = common;
+                    c.dir = PathBuf::from("/tmp/wsroot/packages/common");
+                    c
+                },
+                {
+                    let mut a = app;
+                    a.dir = PathBuf::from("/tmp/wsroot/packages/app");
+                    a
+                },
+            ],
+        };
+        let g = graph::build(&ws).unwrap();
+        let lock = lock_for("rev", vec![]);
+        let nix = generate(&ws, &g, &lock, "build", &["app".to_string()], "x86_64-linux").unwrap();
+
+        // app mounts common as a repo-relative sibling (../common), NOT via
+        // $GRANIT_DEPENDENCIES.
+        assert!(
+            nix.contains("granitSourceDeps = ["),
+            "expected a source-deps list:\n{nix}"
+        );
+        assert!(
+            nix.contains("\"../common:${gp.common}/src\""),
+            "source dep should mount at ../common from app:\n{nix}"
+        );
+        // common's source output is collected into $out/src so it can be mounted.
+        assert!(
+            nix.contains("cp -rL '.' \"$out/src\""),
+            "common should collect its source tree into $out/src:\n{nix}"
+        );
+        // The source-dep mount loop is emitted.
+        assert!(nix.contains("for entry in $granitSourceDeps; do"));
     }
 
     #[test]
