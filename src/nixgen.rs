@@ -21,7 +21,7 @@ use crate::workspace::{Package, Workspace};
 
 /// Which command a generated derivation runs. Defaults to `build`.
 pub fn command_for<'a>(package: &'a Package, command: &str) -> Option<&'a str> {
-    package.commands.get(command).map(|s| s.as_str())
+    package.commands.get(command).map(|c| c.run.as_str())
 }
 
 /// Compute the path from `consumer`'s package dir to `producer_name`'s package
@@ -533,7 +533,13 @@ mod tests {
         build: &str,
     ) -> Package {
         let mut cmds = BTreeMap::new();
-        cmds.insert("build".to_string(), build.to_string());
+        cmds.insert(
+            "build".to_string(),
+            crate::workspace::Command {
+                run: build.to_string(),
+                needs: vec![],
+            },
+        );
         Package {
             name: name.to_string(),
             dir: PathBuf::from(name),

@@ -175,7 +175,44 @@ Nix store).
 In both models, a declared dependency's output is available at
 `$GRANIT_DEPENDENCIES/<package>/<label>` (dependencies are always *built* first),
 and each command is self-contained — running a command does **not** implicitly
-run `build` first.
+run `build` first (see command hooks below to opt into ordering).
+
+#### Command hooks (`needs`)
+
+A command can declare other commands (in the same package) that must run first.
+Use the tagged form of a command — `{ run = "...", needs = ["other", ...] }` —
+instead of a bare string. This is the ergonomic way to say "generate before you
+build" while keeping `generate` independently runnable for local dev:
+
+```toml
+[commands]
+# A standalone dev task — still runnable on its own with `granit run generate`.
+generate = "go generate ./..."
+
+# `build` runs `generate` first, then compiles.
+build = { run = "go build -o bin/app .", needs = ["generate"] }
+
+test = "go test ./..."   # a bare string still works (no hooks)
+```
+
+```sh
+granit build            # runs `generate`, then builds
+granit run generate     # runs just `generate` (unchanged)
+```
+
+Semantics:
+
+- **`needs` hooks run in-place** (the `nix develop` model), in your real source
+  directory, in dependency-first order, each once. So a `generate` hook writes
+  its output back into your working tree, and the subsequent `build` compiles
+  the updated source. Hooks chain transitively (`build` → `generate` →
+  `proto`), and cycles are rejected.
+- Because hooks run in-place, **a `build` with `needs` mutates your working
+  tree and is therefore not fully hermetic.** That is the intended dev-time
+  tradeoff. A future fully-hermetic build mode (e.g. `granit build --release`)
+  is tracked in [`backlog.md`](backlog.md).
+- `needs` may only reference commands defined in the **same package**; granit
+  validates the references and errors clearly if one is missing.
 
 ### Outputs & dependency kinds
 

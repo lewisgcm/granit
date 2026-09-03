@@ -54,8 +54,17 @@ pub struct Package {
     pub exclude: Vec<String>,
     /// label -> declared output (path + kind).
     pub outputs: BTreeMap<String, Output>,
-    /// command name -> command string.
-    pub commands: BTreeMap<String, String>,
+    /// command name -> command (script + needs hooks).
+    pub commands: BTreeMap<String, Command>,
+}
+
+/// A processed named command: a shell script plus its `needs` hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    /// The shell script to run.
+    pub run: String,
+    /// Other command names (same package) that must run first, in order.
+    pub needs: Vec<String>,
 }
 
 /// A processed, labeled package output.
@@ -268,6 +277,42 @@ pub fn load_package(dir: &Path) -> Result<Package> {
         })
         .collect();
 
+    // Convert raw command specs into processed commands (script + needs), and
+    // validate that every `needs` references a command declared in this package.
+    let command_names: std::collections::BTreeSet<&str> =
+        file.commands.keys().map(|s| s.as_str()).collect();
+    let mut commands: BTreeMap<String, Command> = BTreeMap::new();
+    for (cmd_name, spec) in &file.commands {
+        for needed in spec.needs() {
+            if !command_names.contains(needed.as_str()) {
+                let available: Vec<&str> = command_names.iter().copied().collect();
+                bail!(
+                    "in package `{name}` ({}): command `{cmd_name}` needs `{needed}`, \
+                     but no command `{needed}` is defined (available: {})",
+                    manifest_path.display(),
+                    if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                );
+            }
+            if needed == cmd_name {
+                bail!(
+                    "in package `{name}` ({}): command `{cmd_name}` needs itself",
+                    manifest_path.display()
+                );
+            }
+        }
+        commands.insert(
+            cmd_name.clone(),
+            Command {
+                run: spec.run().to_string(),
+                needs: spec.needs().to_vec(),
+            },
+        );
+    }
+
     Ok(Package {
         name,
         dir: dir.to_path_buf(),
@@ -275,7 +320,7 @@ pub fn load_package(dir: &Path) -> Result<Package> {
         dependencies,
         exclude: file.package.exclude,
         outputs,
-        commands: file.commands,
+        commands,
     })
 }
 

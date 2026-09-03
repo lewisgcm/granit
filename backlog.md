@@ -5,6 +5,18 @@ out of the initial version to keep scope focused; each is a candidate for a
 future iteration.
 
 ## Build orchestration
+- [ ] **Hermetic `build` mode (e.g. `granit build --release`).** Command hooks
+  (`needs`) run in-place in the real source tree (dev-style), which means a
+  `build` with `needs` mutates your working tree and is therefore **not
+  hermetic**. Add an opt-in fully-hermetic build (working name
+  `granit build --release`) that runs any `needs` steps *inside* the sandbox
+  (or requires the tree to already be generated) and guarantees no working-tree
+  mutation. Track and, where possible, warn about the non-hermetic aspects a
+  normal `build` introduces (in-place hooks, source-tree writes).
+- [ ] **Cross-model / cross-package command hooks.** `needs` currently chains
+  commands within a single package and runs them in-place. Consider hooks that
+  depend on commands in *other* packages, and finer control over which
+  execution model a hook uses (in-place vs sandboxed).
 - [ ] **Per-package, granit-driven build orchestration.** Today granit emits a
   single `flake.nix` and lets Nix resolve the whole graph in one `nix build`.
   An alternative is for granit to topologically drive `nix build` per package,

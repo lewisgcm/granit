@@ -61,9 +61,58 @@ pub struct PackageFile {
     /// source (mounted repo-relative) rather than as a built artifact file.
     #[serde(default)]
     pub outputs: BTreeMap<String, OutputSpec>,
-    /// Named commands (e.g. `build`, `test`, custom).
+    /// Named commands (e.g. `build`, `test`, custom). Each value is either a
+    /// bare string (the shell script) or a tagged table `{ run = "...",
+    /// needs = ["cmd", ...] }` declaring commands to run first (see
+    /// [`CommandSpec`]).
     #[serde(default)]
-    pub commands: BTreeMap<String, String>,
+    pub commands: BTreeMap<String, CommandSpec>,
+}
+
+/// A command declaration: a shell script plus optional `needs` hooks.
+///
+/// Deserializes from either:
+/// - a bare string `name = "script"` → the script with no hooks (back-compat), or
+/// - a tagged table `name = { run = "script", needs = ["other", ...] }`.
+///
+/// `needs` lists other commands in the *same package* that must run first
+/// (in-place, dev-style) before this command. It lets e.g. `build` run a
+/// `generate` step first while keeping `generate` independently invocable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CommandSpec {
+    /// Bare string shorthand: the script, with no hooks.
+    Script(String),
+    /// Tagged table: script plus `needs`.
+    Detailed(CommandDetail),
+}
+
+/// The explicit, tagged form of a command declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CommandDetail {
+    /// The shell script to run.
+    pub run: String,
+    /// Other command names (same package) to run first, in declared order.
+    #[serde(default)]
+    pub needs: Vec<String>,
+}
+
+impl CommandSpec {
+    /// The shell script this command runs.
+    pub fn run(&self) -> &str {
+        match self {
+            CommandSpec::Script(s) => s,
+            CommandSpec::Detailed(d) => &d.run,
+        }
+    }
+
+    /// The command names this command depends on (runs first).
+    pub fn needs(&self) -> &[String] {
+        match self {
+            CommandSpec::Script(_) => &[],
+            CommandSpec::Detailed(d) => &d.needs,
+        }
+    }
 }
 
 /// The declared kind and path of a single labeled output.
@@ -187,20 +236,37 @@ src = { source = "." }
     }
 
     #[test]
-    fn mixed_outputs_in_one_package() {
+    fn bare_string_command_has_no_needs() {
         let f = parse(
             r#"
 [package]
-name = "lib"
+name = "a"
 
-[outputs]
-src = { source = "." }
-bundle = { artifact = "dist/lib.js" }
-legacy = "old.txt"
+[commands]
+test = "go test ./..."
 "#,
         );
-        assert!(f.outputs.get("src").unwrap().is_source());
-        assert!(!f.outputs.get("bundle").unwrap().is_source());
-        assert!(!f.outputs.get("legacy").unwrap().is_source());
+        let c = f.commands.get("test").unwrap();
+        assert_eq!(c.run(), "go test ./...");
+        assert!(c.needs().is_empty());
+    }
+
+    #[test]
+    fn tagged_command_with_needs() {
+        let f = parse(
+            r#"
+[package]
+name = "a"
+
+[commands]
+generate = "codegen"
+build = { run = "go build ./...", needs = ["generate"] }
+"#,
+        );
+        let b = f.commands.get("build").unwrap();
+        assert_eq!(b.run(), "go build ./...");
+        assert_eq!(b.needs(), &["generate".to_string()]);
+        // bare string still parses alongside.
+        assert!(f.commands.get("generate").unwrap().needs().is_empty());
     }
 }

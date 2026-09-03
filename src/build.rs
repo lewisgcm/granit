@@ -234,12 +234,9 @@ pub fn build_command<R: CommandRunner>(
     runner: &R,
     explicit_target: Option<&str>,
 ) -> Result<()> {
-    let cwd = std::env::current_dir().context("could not determine current directory")?;
-    let (ws, g) = load_workspace_and_graph(&cwd)?;
-    let built = run_build(runner, &ws, &g, explicit_target, "build", &cwd)?;
-    println!("granit: build complete ({} package(s))", built.len());
-    print_output_locations(&built);
-    Ok(())
+    // `build` is a normal named command: this runs any `needs` hooks in-place
+    // first, then the hermetic build derivation.
+    run_named_command(runner, explicit_target, "build")
 }
 
 /// Entry point for `granit graph`: print the dependency graph and build order.
@@ -323,8 +320,33 @@ pub fn run_named_command<R: CommandRunner>(
     let (ws, g) = load_workspace_and_graph(&cwd)?;
 
     // Validate the command exists for all resolved targets before doing work.
+    // `build` and `test` are tolerant of absence (e.g. a source-only library
+    // has no build command — its derivation just collects its source output);
+    // custom `run` commands must be explicitly defined.
     let targets = resolve_targets(&ws, explicit_target, &cwd)?;
-    ensure_command_present(&ws, &targets, command)?;
+    if command != "build" && command != "test" {
+        ensure_command_present(&ws, &targets, command)?;
+    }
+
+    // Run each target's `needs` hooks first, in-place (dev-style). Hooks run
+    // in the real source tree so steps like `generate` write back into it
+    // before the target command runs. This makes a `build` with `needs`
+    // non-hermetic by design (see backlog: hermetic `--release` build).
+    let system = current_system(runner)?;
+    let lock = lock::ensure_lock(&ws, runner)?;
+    let flake = nixgen::generate(&ws, &g, &lock, "build", &[], &system)?;
+    let flake_dir = write_flake(&ws, &flake)?;
+    let flake_dir_str = flake_dir
+        .to_str()
+        .context("generated flake directory path is not valid UTF-8")?
+        .to_string();
+    for target in &targets {
+        let pkg = ws.package(target).expect("target resolved from workspace");
+        let hooks = resolve_command_hooks(pkg, command)?;
+        for hook in &hooks {
+            run_command_in_place(runner, &ws, &flake_dir_str, &system, target, hook)?;
+        }
+    }
 
     // `build`/`test` are hermetic derivations; everything else runs in-place.
     if command == "build" || command == "test" {
@@ -335,6 +357,92 @@ pub fn run_named_command<R: CommandRunner>(
     }
 
     run_dev_command(runner, &ws, &g, &targets, command)
+}
+
+/// Compute the ordered list of `needs` hooks to run before `command` in
+/// `pkg` — the transitive closure of `needs`, in dependency-first order, each
+/// once, excluding `command` itself. Detects cycles among command hooks.
+fn resolve_command_hooks(
+    pkg: &crate::workspace::Package,
+    command: &str,
+) -> Result<Vec<String>> {
+    use std::collections::BTreeSet;
+
+    let mut order: Vec<String> = Vec::new();
+    let mut done: BTreeSet<String> = BTreeSet::new();
+    // `path` tracks the active DFS chain for cycle reporting.
+    fn visit(
+        pkg: &crate::workspace::Package,
+        name: &str,
+        order: &mut Vec<String>,
+        done: &mut BTreeSet<String>,
+        path: &mut Vec<String>,
+    ) -> Result<()> {
+        if done.contains(name) {
+            return Ok(());
+        }
+        if path.iter().any(|p| p == name) {
+            path.push(name.to_string());
+            bail!("command hook cycle detected: {}", path.join(" -> "));
+        }
+        let Some(cmd) = pkg.commands.get(name) else {
+            // Validated at load time, but guard defensively.
+            bail!("package `{}` has no command `{name}`", pkg.name);
+        };
+        path.push(name.to_string());
+        for needed in &cmd.needs {
+            visit(pkg, needed, order, done, path)?;
+        }
+        path.pop();
+        done.insert(name.to_string());
+        order.push(name.to_string());
+        Ok(())
+    }
+
+    // Visit the target's needs (but not the target itself); the target runs
+    // afterwards via its own path. If the target command isn't defined for this
+    // package (e.g. a source lib with no `build`), there are no hooks.
+    let Some(cmd) = pkg.commands.get(command) else {
+        return Ok(order);
+    };
+    let mut path: Vec<String> = vec![command.to_string()];
+    for needed in &cmd.needs {
+        visit(pkg, needed, &mut order, &mut done, &mut path)?;
+    }
+    Ok(order)
+}
+
+/// Run a single command in `target`'s real source directory via `nix develop`
+/// against the generated per-package devShell.
+fn run_command_in_place<R: CommandRunner>(
+    runner: &R,
+    workspace: &Workspace,
+    flake_dir_str: &str,
+    system: &str,
+    target: &str,
+    command: &str,
+) -> Result<()> {
+    let pkg = workspace.package(target).expect("target resolved from workspace");
+    let script = pkg
+        .commands
+        .get(command)
+        .map(|c| c.run.as_str())
+        .expect("command presence validated");
+    let shell_ref = format!("path:{flake_dir_str}#devShells.{system}.{target}");
+    println!("granit: running `{command}` in `{target}` ({}) ...", pkg.dir.display());
+    let out = crate::nix::run_streamed(
+        runner,
+        &["develop", &shell_ref, "--command", "sh", "-c", script],
+        Some(&pkg.dir),
+    )
+    .with_context(|| format!("failed to run `{command}` in `{target}`"))?;
+    if !out.success {
+        bail!(
+            "command `{command}` failed in package `{target}` (exit {:?})",
+            out.code
+        );
+    }
+    Ok(())
 }
 
 /// Run a custom command in each target package's real source directory using a
@@ -360,31 +468,7 @@ fn run_dev_command<R: CommandRunner>(
         .to_string();
 
     for target in targets {
-        let pkg = workspace
-            .package(target)
-            .expect("target was resolved from the workspace");
-        let user_cmd = pkg
-            .commands
-            .get(command)
-            .expect("command presence was validated");
-
-        let shell_ref = format!("path:{flake_dir_str}#devShells.{system}.{target}");
-        println!("granit: running `{command}` in `{target}` ({}) ...", pkg.dir.display());
-
-        // `nix develop <shell> --command sh -c '<cmd>'` runs the command with
-        // the devShell environment active, in the package's real directory.
-        let out = crate::nix::run_streamed(
-            runner,
-            &["develop", &shell_ref, "--command", "sh", "-c", user_cmd],
-            Some(&pkg.dir),
-        )
-        .with_context(|| format!("failed to run `{command}` in `{target}`"))?;
-        if !out.success {
-            bail!(
-                "command `{command}` failed in package `{target}` (exit {:?})",
-                out.code
-            );
-        }
+        run_command_in_place(runner, workspace, &flake_dir_str, &system, target, command)?;
     }
 
     println!("granit: `{command}` complete ({} package(s))", targets.len());
@@ -490,7 +574,15 @@ mod tests {
         let mut p = pkg(name, dir);
         p.commands = cmds
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    crate::workspace::Command {
+                        run: v.to_string(),
+                        needs: vec![],
+                    },
+                )
+            })
             .collect();
         p
     }
@@ -505,15 +597,71 @@ mod tests {
         assert!(ensure_command_present(&ws, &["a".to_string()], "test").is_ok());
     }
 
+    fn pkg_with_needs(name: &str, cmds: &[(&str, &[&str])]) -> Package {
+        let mut p = pkg(name, PathBuf::from(name));
+        p.commands = cmds
+            .iter()
+            .map(|(k, needs)| {
+                (
+                    k.to_string(),
+                    crate::workspace::Command {
+                        run: format!("run-{k}"),
+                        needs: needs.iter().map(|s| s.to_string()).collect(),
+                    },
+                )
+            })
+            .collect();
+        p
+    }
+
     #[test]
-    fn ensure_command_present_errors_when_missing() {
-        let root = PathBuf::from("/tmp/x");
-        let ws = ws_with(
-            root.clone(),
-            vec![pkg_with_cmds("a", root.join("a"), &[("build", "true")])],
+    fn hooks_none_when_no_needs() {
+        let p = pkg_with_needs("a", &[("build", &[])]);
+        assert!(resolve_command_hooks(&p, "build").unwrap().is_empty());
+    }
+
+    #[test]
+    fn hooks_single_need() {
+        let p = pkg_with_needs("a", &[("generate", &[]), ("build", &["generate"])]);
+        assert_eq!(resolve_command_hooks(&p, "build").unwrap(), vec!["generate"]);
+    }
+
+    #[test]
+    fn hooks_transitive_ordered_and_deduped() {
+        // build -> [gen, compile]; gen -> [proto]; compile -> [proto]
+        let p = pkg_with_needs(
+            "a",
+            &[
+                ("proto", &[]),
+                ("gen", &["proto"]),
+                ("compile", &["proto"]),
+                ("build", &["gen", "compile"]),
+            ],
         );
-        let err = ensure_command_present(&ws, &["a".to_string()], "test").unwrap_err();
-        assert!(err.to_string().contains("no `test` command"), "{err}");
-        assert!(err.to_string().contains("build"), "should list available: {err}");
+        let order = resolve_command_hooks(&p, "build").unwrap();
+        // proto appears once and before gen and compile.
+        assert_eq!(order.iter().filter(|c| *c == "proto").count(), 1);
+        let pos = |n: &str| order.iter().position(|c| c == n).unwrap();
+        assert!(pos("proto") < pos("gen"));
+        assert!(pos("proto") < pos("compile"));
+        assert!(!order.contains(&"build".to_string()));
+    }
+
+    #[test]
+    fn hooks_cycle_detected() {
+        // a -> b -> a among hooks.
+        let p = pkg_with_needs(
+            "a",
+            &[("x", &["y"]), ("y", &["x"]), ("build", &["x"])],
+        );
+        let err = resolve_command_hooks(&p, "build").unwrap_err();
+        assert!(err.to_string().contains("cycle detected"), "{err}");
+    }
+
+    #[test]
+    fn hooks_absent_target_command_yields_no_hooks() {
+        // A source-lib style package with no `build` command.
+        let p = pkg_with_needs("a", &[("test", &[])]);
+        assert!(resolve_command_hooks(&p, "build").unwrap().is_empty());
     }
 }
