@@ -177,7 +177,7 @@ pub fn run_build<R: CommandRunner>(
             .unwrap_or_default();
 
         let out_path = if command == "build" {
-            link_build_outputs(runner, workspace, &attr, target, &labels)
+            link_build_outputs(runner, workspace, &attr, target)
                 .with_context(|| format!("linking outputs for `{target}`"))?
         } else {
             // The build is now in the store; query its path without rebuilding.
@@ -200,30 +200,20 @@ pub fn run_build<R: CommandRunner>(
 /// tree: `.granit/build/<package>/<label>`.
 const BUILD_LINK_DIR: &str = ".granit/build";
 
-/// Create a stable, GC-rooted link tree for a built package under
-/// `.granit/build/<pkg>/`:
-/// - `result` is a GC root (via `nix build --out-link`) pointing at `$out`, so
-///   the output survives `nix-collect-garbage`.
-/// - one relative symlink per declared label, `<label> -> result/<label>`,
-///   pointing directly at that artifact.
-///
-/// Only this package's directory is touched; stale label links in it are
-/// removed first so a removed/renamed label does not linger. Returns the output
-/// store path.
+/// Create a stable, GC-rooted output link for a built package at
+/// `.granit/build/<pkg>/result` (via `nix build --out-link`), pointing at
+/// `$out`. Each declared label is then reachable at `result/<label>` (that's
+/// how the install phase lays out `$out`), so no per-label links are needed.
+/// The `result` link is a GC root, so the output survives
+/// `nix-collect-garbage`. Only this package's directory is touched. Returns the
+/// output store path.
 fn link_build_outputs<R: CommandRunner>(
     runner: &R,
     workspace: &Workspace,
     attr: &str,
     package: &str,
-    labels: &[String],
 ) -> Result<String> {
     let pkg_dir = workspace.root.join(BUILD_LINK_DIR).join(package);
-    // Recreate the package's link dir fresh (clears stale label links) — but
-    // only for this package, leaving other packages' entries intact.
-    if pkg_dir.exists() {
-        std::fs::remove_dir_all(&pkg_dir)
-            .with_context(|| format!("failed to clear {}", pkg_dir.display()))?;
-    }
     std::fs::create_dir_all(&pkg_dir)
         .with_context(|| format!("failed to create {}", pkg_dir.display()))?;
 
@@ -257,39 +247,7 @@ fn link_build_outputs<R: CommandRunner>(
     if out_path.is_empty() {
         bail!("nix did not report an output path");
     }
-
-    // Per-label convenience symlinks pointing at result/<label> (relative, so
-    // they follow the GC-rooted result link and stay valid).
-    for label in labels {
-        let link = pkg_dir.join(label);
-        // Support labels that contain path separators by creating parent dirs.
-        if let Some(parent) = link.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        let target = format!("result/{label}");
-        symlink_relative(&target, &link)
-            .with_context(|| format!("failed to symlink {} -> {target}", link.display()))?;
-    }
-
     Ok(out_path)
-}
-
-/// Create a relative symlink at `link` pointing to `target`, replacing any
-/// existing entry.
-fn symlink_relative(target: &str, link: &Path) -> Result<()> {
-    if link.exists() || link.symlink_metadata().is_ok() {
-        let _ = std::fs::remove_file(link);
-    }
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link)?;
-    }
-    #[cfg(windows)]
-    {
-        std::os::windows::fs::symlink_file(target, link)?;
-    }
-    Ok(())
 }
 
 /// Query a built flake attribute's output store path (cached; no rebuild).
@@ -328,10 +286,10 @@ fn print_output_locations(built: &[BuiltPackage]) {
             println!("  {} -> {}", pkg.name, pkg.out_path);
         } else {
             for label in &pkg.labels {
-                // Point at the stable, GC-rooted link tree; the store path is
+                // Point at the stable, GC-rooted result link; the store path is
                 // what it resolves to.
                 println!(
-                    "  {}:{} -> {}/{}/{} ({}/{})",
+                    "  {}:{} -> {}/{}/result/{} ({}/{})",
                     pkg.name,
                     label,
                     BUILD_LINK_DIR,
@@ -782,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn link_build_outputs_creates_relative_per_label_symlinks() {
+    fn link_build_outputs_creates_gc_rooted_result_link() {
         use crate::runner::mock::{ok, MockRunner};
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
@@ -792,28 +750,21 @@ mod tests {
         let store = "/nix/store/deadbeef-a-0.0.0";
         let runner = MockRunner::new().with_default(ok(&format!("{store}\n")));
 
-        let labels = vec!["hello".to_string(), "nested/thing".to_string()];
-        let out = link_build_outputs(&runner, &ws, "attr", "a", &labels).unwrap();
+        let out = link_build_outputs(&runner, &ws, "attr", "a").unwrap();
         assert_eq!(out, store);
 
-        let dir = root.join(BUILD_LINK_DIR).join("a");
-        // Per-label symlinks exist and point at result/<label> (relative).
-        let hello = dir.join("hello");
-        assert_eq!(
-            std::fs::read_link(&hello).unwrap().to_string_lossy(),
-            "result/hello"
+        // A `result` entry exists under .granit/build/a. (The mock doesn't
+        // create the symlink Nix would, but the dir is prepared and the call
+        // targets result via --out-link.)
+        let pkg_dir = root.join(BUILD_LINK_DIR).join("a");
+        assert!(pkg_dir.is_dir(), "package link dir should be created");
+        // The nix invocation requested --out-link at .granit/build/a/result.
+        let calls = runner.calls.borrow();
+        let joined = calls.join("\n");
+        assert!(
+            joined.contains("--out-link") && joined.contains("/.granit/build/a/result"),
+            "should build with --out-link at the result path:\n{joined}"
         );
-        // Nested label creates parent dirs and a relative target.
-        let nested = dir.join("nested/thing");
-        assert_eq!(
-            std::fs::read_link(&nested).unwrap().to_string_lossy(),
-            "result/nested/thing"
-        );
-
-        // A stale link from a previous build is cleared on the next build.
-        std::fs::write(dir.join("stale-marker"), "x").unwrap();
-        let _ = link_build_outputs(&runner, &ws, "attr", "a", &["hello".to_string()]).unwrap();
-        assert!(!dir.join("stale-marker").exists(), "stale entries should be cleared");
-        assert!(dir.join("hello").symlink_metadata().is_ok());
+        assert!(joined.contains("--print-out-paths"));
     }
 }

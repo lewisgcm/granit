@@ -78,6 +78,10 @@ You can run `build`/`test`/`run` from inside a package directory; granit walks u
 to find the workspace root and defaults the target to that package. The root
 `granit.lock` is always used.
 
+Any command can declare other commands to run first via
+[`needs` hooks](#command-hooks-needs), and after a build each package's output
+is linked under [`.granit/build/<pkg>/result`](#build-outputs).
+
 ## Workspace format (`granit.toml`)
 
 ```toml
@@ -343,18 +347,18 @@ directory are implementation details and are gitignored.
 
 ## Build outputs
 
-After `granit build`, each built package's outputs are linked under a stable,
+After `granit build`, each built package's output is linked under a stable,
 discoverable tree at the workspace root:
 
 ```
 .granit/build/<package>/
   result       -> /nix/store/…-<package>-0.0.0   # GC root (survives nix-collect-garbage)
-  <label>      -> result/<label>                 # one per declared [outputs] label
 ```
 
-So `.granit/build/api-spec/schema.yml` points straight at the built schema. The
-per-package `result` link is a Nix **GC root**, so builds you've made won't be
-removed by `nix-collect-garbage`. The tree is refreshed per built package —
+Each declared `[outputs]` label lives inside, at `result/<label>` — so
+`.granit/build/api-spec/result/schema.yml` points straight at the built schema.
+The per-package `result` link is a Nix **GC root**, so builds you've made won't
+be removed by `nix-collect-garbage`. The tree is refreshed per built package —
 building one package leaves other packages' links untouched — and `.granit/` is
 gitignored. Only `granit build` populates it (custom `granit run` commands run
 in-place and collect no outputs).
