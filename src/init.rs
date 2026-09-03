@@ -80,7 +80,7 @@ pub fn init_workspace(root: &Path) -> Result<()> {
     if !gitignore.exists() {
         let _ = std::fs::write(
             &gitignore,
-            "# granit generates these; granit.lock is committed.\nflake.nix\nflake.lock\nresult\nresult-*\n",
+            "# granit generates these; granit.lock is committed.\nflake.nix\nflake.lock\n.granit/\nresult\nresult-*\n",
         );
     }
 

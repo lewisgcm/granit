@@ -167,14 +167,23 @@ pub fn run_build<R: CommandRunner>(
             );
         }
 
-        // The build is now in the store; query its out path without rebuilding.
-        let out_path = query_out_path(runner, &attr)
-            .with_context(|| format!("determining output path for `{target}`"))?;
-
+        // Determine the output store path. For `build`, also materialize a
+        // stable, GC-rooted link tree under `.granit/build/<pkg>/` so outputs
+        // are discoverable and survive `nix-collect-garbage`. Only the packages
+        // built this invocation are touched.
         let labels = workspace
             .package(target)
             .map(|p| p.outputs.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+
+        let out_path = if command == "build" {
+            link_build_outputs(runner, workspace, &attr, target, &labels)
+                .with_context(|| format!("linking outputs for `{target}`"))?
+        } else {
+            // The build is now in the store; query its path without rebuilding.
+            query_out_path(runner, &attr)
+                .with_context(|| format!("determining output path for `{target}`"))?
+        };
 
         println!("granit: built `{target}` -> {out_path}");
         built.push(BuiltPackage {
@@ -185,6 +194,102 @@ pub fn run_build<R: CommandRunner>(
     }
 
     Ok(built)
+}
+
+/// The workspace-relative directory holding the stable, GC-rooted output link
+/// tree: `.granit/build/<package>/<label>`.
+const BUILD_LINK_DIR: &str = ".granit/build";
+
+/// Create a stable, GC-rooted link tree for a built package under
+/// `.granit/build/<pkg>/`:
+/// - `result` is a GC root (via `nix build --out-link`) pointing at `$out`, so
+///   the output survives `nix-collect-garbage`.
+/// - one relative symlink per declared label, `<label> -> result/<label>`,
+///   pointing directly at that artifact.
+///
+/// Only this package's directory is touched; stale label links in it are
+/// removed first so a removed/renamed label does not linger. Returns the output
+/// store path.
+fn link_build_outputs<R: CommandRunner>(
+    runner: &R,
+    workspace: &Workspace,
+    attr: &str,
+    package: &str,
+    labels: &[String],
+) -> Result<String> {
+    let pkg_dir = workspace.root.join(BUILD_LINK_DIR).join(package);
+    // Recreate the package's link dir fresh (clears stale label links) — but
+    // only for this package, leaving other packages' entries intact.
+    if pkg_dir.exists() {
+        std::fs::remove_dir_all(&pkg_dir)
+            .with_context(|| format!("failed to clear {}", pkg_dir.display()))?;
+    }
+    std::fs::create_dir_all(&pkg_dir)
+        .with_context(|| format!("failed to create {}", pkg_dir.display()))?;
+
+    // `nix build --out-link <result>` creates a GC-rooted symlink to $out and,
+    // with --print-out-paths, prints the store path. Cached (already built).
+    let result_link = pkg_dir.join("result");
+    let result_link_str = result_link
+        .to_str()
+        .context("result link path is not valid UTF-8")?;
+    let out = crate::nix::run_captured(
+        runner,
+        &[
+            "build",
+            attr,
+            "--out-link",
+            result_link_str,
+            "--print-out-paths",
+        ],
+    )
+    .context("failed to create output link via nix")?;
+    if !out.success {
+        bail!("could not link output:\n{}", out.stderr.trim());
+    }
+    let out_path = out
+        .stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string();
+    if out_path.is_empty() {
+        bail!("nix did not report an output path");
+    }
+
+    // Per-label convenience symlinks pointing at result/<label> (relative, so
+    // they follow the GC-rooted result link and stay valid).
+    for label in labels {
+        let link = pkg_dir.join(label);
+        // Support labels that contain path separators by creating parent dirs.
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let target = format!("result/{label}");
+        symlink_relative(&target, &link)
+            .with_context(|| format!("failed to symlink {} -> {target}", link.display()))?;
+    }
+
+    Ok(out_path)
+}
+
+/// Create a relative symlink at `link` pointing to `target`, replacing any
+/// existing entry.
+fn symlink_relative(target: &str, link: &Path) -> Result<()> {
+    if link.exists() || link.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(link);
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)?;
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link)?;
+    }
+    Ok(())
 }
 
 /// Query a built flake attribute's output store path (cached; no rebuild).
@@ -223,7 +328,18 @@ fn print_output_locations(built: &[BuiltPackage]) {
             println!("  {} -> {}", pkg.name, pkg.out_path);
         } else {
             for label in &pkg.labels {
-                println!("  {}:{} -> {}/{}", pkg.name, label, pkg.out_path, label);
+                // Point at the stable, GC-rooted link tree; the store path is
+                // what it resolves to.
+                println!(
+                    "  {}:{} -> {}/{}/{} ({}/{})",
+                    pkg.name,
+                    label,
+                    BUILD_LINK_DIR,
+                    pkg.name,
+                    label,
+                    pkg.out_path,
+                    label
+                );
             }
         }
     }
@@ -663,5 +779,41 @@ mod tests {
         // A source-lib style package with no `build` command.
         let p = pkg_with_needs("a", &[("test", &[])]);
         assert!(resolve_command_hooks(&p, "build").unwrap().is_empty());
+    }
+
+    #[test]
+    fn link_build_outputs_creates_relative_per_label_symlinks() {
+        use crate::runner::mock::{ok, MockRunner};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let ws = ws_with(root.clone(), vec![pkg("a", root.join("packages/a"))]);
+
+        // The mock returns a store path for the --out-link build call.
+        let store = "/nix/store/deadbeef-a-0.0.0";
+        let runner = MockRunner::new().with_default(ok(&format!("{store}\n")));
+
+        let labels = vec!["hello".to_string(), "nested/thing".to_string()];
+        let out = link_build_outputs(&runner, &ws, "attr", "a", &labels).unwrap();
+        assert_eq!(out, store);
+
+        let dir = root.join(BUILD_LINK_DIR).join("a");
+        // Per-label symlinks exist and point at result/<label> (relative).
+        let hello = dir.join("hello");
+        assert_eq!(
+            std::fs::read_link(&hello).unwrap().to_string_lossy(),
+            "result/hello"
+        );
+        // Nested label creates parent dirs and a relative target.
+        let nested = dir.join("nested/thing");
+        assert_eq!(
+            std::fs::read_link(&nested).unwrap().to_string_lossy(),
+            "result/nested/thing"
+        );
+
+        // A stale link from a previous build is cleared on the next build.
+        std::fs::write(dir.join("stale-marker"), "x").unwrap();
+        let _ = link_build_outputs(&runner, &ws, "attr", "a", &["hello".to_string()]).unwrap();
+        assert!(!dir.join("stale-marker").exists(), "stale entries should be cleared");
+        assert!(dir.join("hello").symlink_metadata().is_ok());
     }
 }

@@ -130,7 +130,7 @@ generate = "go generate ./..."
 ```
 
 `granit build --emit-only [pkg]` prints the generated flake to stdout without
-writing it; a normal build writes it to `.granit/flake.nix`.
+writing it; a normal build writes it to `flake.nix` at the workspace root.
 
 ### Custom commands
 
@@ -338,8 +338,26 @@ you intend to copy). To match at any depth, use a glob or slash-bearing path:
 records the exact resolved revision and hash of nixpkgs and every overlay. On the
 first build granit resolves and writes it; afterwards it is reused as-is. Run
 `granit update` to re-resolve. **Commit `granit.lock`**; the generated flake
-(written to `.granit/flake.nix` plus its `.granit/flake.lock`) is an
-implementation detail and is gitignored.
+(`flake.nix`/`flake.lock` at the workspace root) and the `.granit/` working
+directory are implementation details and are gitignored.
+
+## Build outputs
+
+After `granit build`, each built package's outputs are linked under a stable,
+discoverable tree at the workspace root:
+
+```
+.granit/build/<package>/
+  result       -> /nix/store/…-<package>-0.0.0   # GC root (survives nix-collect-garbage)
+  <label>      -> result/<label>                 # one per declared [outputs] label
+```
+
+So `.granit/build/api-spec/schema.yml` points straight at the built schema. The
+per-package `result` link is a Nix **GC root**, so builds you've made won't be
+removed by `nix-collect-garbage`. The tree is refreshed per built package —
+building one package leaves other packages' links untouched — and `.granit/` is
+gitignored. Only `granit build` populates it (custom `granit run` commands run
+in-place and collect no outputs).
 
 ## Example
 
