@@ -28,6 +28,19 @@ behind a familiar, ergonomic format.
 
 ## Install
 
+Pre-built binaries for Linux and macOS (x86_64 and arm64) are attached to each
+[GitHub release](https://github.com/lewisgcm/granit/releases):
+
+```sh
+# Pick your platform: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl,
+# x86_64-apple-darwin or aarch64-apple-darwin.
+target=aarch64-apple-darwin
+curl -fsSL "https://github.com/lewisgcm/granit/releases/latest/download/granit-$target.tar.gz" \
+  | tar -xz -C /usr/local/bin granit
+```
+
+To build from source instead:
+
 ```sh
 # Install the `granit` binary to ~/.cargo/bin (must be on your PATH).
 cargo install --path .
