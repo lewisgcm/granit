@@ -1,0 +1,13 @@
+[book]
+title = "Granit"
+description = "A simple monorepo build tool that wraps Nix flakes"
+authors = ["Lewis Maitland"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/lewisgcm/granit"
+edit-url-template = "https://github.com/lewisgcm/granit/edit/main/docs/{path}"
+site-url = "/granit/"
+default-theme = "light"
+preferred-dark-theme = "navy"

@@ -9,6 +9,8 @@ between packages. Granit generates a `flake.nix`, manages a `granit.lock` for
 reproducibility, and shells out to `nix build` — wrapping Nix's complexity
 behind a familiar, ergonomic format.
 
+📖 **Documentation: <https://lewisgcm.github.io/granit/>**
+
 ## Goals
 
 1. **Simplified interface over nixpkgs.** Bring in build-time tools (java, node,

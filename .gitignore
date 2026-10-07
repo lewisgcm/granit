@@ -16,3 +16,6 @@ flake.lock
 # copy, so we don't commit a stale pin for it.
 examples/**/granit.lock
 .idea
+
+# mdBook output
+/docs/book
